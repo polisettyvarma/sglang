@@ -107,8 +107,12 @@ class FusedOpPool:
             raise ValueError(
                 f"Fused function for {a2a_backend_name} to {runner_backend_name} is already registered."
             )
-        assert MoeA2ABackend(a2a_backend_name), f"Invalid dispatch name: {a2a_backend_name}"
-        assert MoeRunnerBackend(runner_backend_name), f"Invalid runner name: {runner_backend_name}"
+        assert MoeA2ABackend(
+            a2a_backend_name
+        ), f"Invalid dispatch name: {a2a_backend_name}"
+        assert MoeRunnerBackend(
+            runner_backend_name
+        ), f"Invalid runner name: {runner_backend_name}"
         cls._fused_funcs[key] = fused_func
 
     @classmethod
@@ -235,7 +239,9 @@ def register_fused_func(
     """
 
     def decorator(fused_func: Callable):
-        FusedOpPool.register_fused_func(a2a_backend_name, runner_backend_name, fused_func)
+        FusedOpPool.register_fused_func(
+            a2a_backend_name, runner_backend_name, fused_func
+        )
         return fused_func
 
     return decorator

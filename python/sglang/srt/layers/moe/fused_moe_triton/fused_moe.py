@@ -22,7 +22,6 @@ from sglang.srt.utils import (
     is_hip,
 )
 
-
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import invoke_fused_moe_kernel, moe_sum_reduce_triton
 from .moe_align_block_size import moe_align_block_size

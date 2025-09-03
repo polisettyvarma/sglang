@@ -7,9 +7,9 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
+from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
