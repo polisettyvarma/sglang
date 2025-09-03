@@ -81,7 +81,7 @@ class DispatchOutputFormat(Enum):
 class DispatchOutput(Protocol):
     """Protocol for dispatch outputs in different formats."""
 
-    hidden_states: torch.Tensor
+    # TODO: add hidden_states to the protocol
 
     @property
     def format(self) -> DispatchOutputFormat: ...
@@ -129,7 +129,7 @@ class CombineInputFormat(Enum):
 class CombineInput(Protocol):
     """Protocol for combine inputs in different formats."""
 
-    hidden_states: torch.Tensor
+    # TODO: add hidden_states to the protocol
 
     @property
     def format(self) -> CombineInputFormat: ...

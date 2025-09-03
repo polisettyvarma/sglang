@@ -488,7 +488,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             per_channel_quant=False,
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            a1_scale=layer.w13_input_scale,
+            a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
         )
 

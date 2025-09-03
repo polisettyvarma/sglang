@@ -97,16 +97,15 @@ class AscendDeepEPLLOutput(NamedTuple):
         return DispatchOutputFormat.ASCENT_LL
 
 
-# FIXME
-# assert isinstance(DeepEPNormalOutput, DispatchOutput)
-# assert isinstance(DeepEPLLOutput, DispatchOutput)
-# assert isinstance(AscendDeepEPLLOutput, DispatchOutput)
+assert isinstance(DeepEPNormalOutput, DispatchOutput)
+assert isinstance(DeepEPLLOutput, DispatchOutput)
+assert isinstance(AscendDeepEPLLOutput, DispatchOutput)
 
 
 class DeepEPNormalCombineInput(NamedTuple):
     """DeepEP normal combine input."""
 
-    pass  # TODO: implement it
+    pass
 
     @property
     def format(self) -> CombineInputFormat:
@@ -116,16 +115,15 @@ class DeepEPNormalCombineInput(NamedTuple):
 class DeepEPLLCombineInput(NamedTuple):
     """DeepEP low latency combine input."""
 
-    pass  # TODO: implement it
+    pass
 
     @property
     def format(self) -> CombineInputFormat:
         return CombineInputFormat.DEEPEP_LL
 
 
-# FIXME
-# assert isinstance(DeepEPNormalCombineInput, CombineInput)
-# assert isinstance(DeepEPLLCombineInput, CombineInput)
+assert isinstance(DeepEPNormalCombineInput, CombineInput)
+assert isinstance(DeepEPLLCombineInput, CombineInput)
 
 
 class DeepEPDispatchMode(IntEnum):
