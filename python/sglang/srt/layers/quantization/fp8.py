@@ -1018,12 +1018,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert DispatchOutputChecker.format_is_standard(
-            dispatch_output
-        ), NotImplementedError(
-            "Only standard dispatch output is supported for fp8 quantization"
-        )
-
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         moe_runner_config = self.moe_runner_config
