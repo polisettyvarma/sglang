@@ -224,6 +224,7 @@ MLA_ATTENTION_BACKENDS = [
     "trtllm_mla",
     "ascend",
     "nsa",
+    "intel_xpu",
 ]
 
 CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
