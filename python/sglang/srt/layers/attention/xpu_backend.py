@@ -368,15 +368,17 @@ class XPUAttentionBackend(AttentionBackend):
             ]
 
         if self.use_mla:
+        if self.use_mla:
             workspace_size = flash_mla_get_workspace_size(
                 self.max_context_len,
                 batch_size,
                 sm_count=get_device_core_count(),
                 num_kv_splits=-1,
             )
-            self.workspace = torch.empty(
-                workspace_size, device=self.device, dtype=torch.uint8
-            )
+            if not hasattr(self, "workspace") or self.workspace.numel() < workspace_size:
+                self.workspace = torch.empty(
+                    workspace_size, device=self.device, dtype=torch.uint8
+                )
 
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:
