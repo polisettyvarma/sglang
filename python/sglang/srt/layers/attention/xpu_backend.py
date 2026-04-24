@@ -890,7 +890,7 @@ class XPUAttentionBackend(AttentionBackend):
                 q_nope,
                 q_rope,
                 kv_cache.view(-1, self.page_size, layer.head_dim),
-                forward_batch.seq_lens.to(torch.int32),
+                metadata.cache_seqlens_int32,
                 metadata.page_table,
                 self.workspace,
                 layer.scaling,
