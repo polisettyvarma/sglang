@@ -61,9 +61,6 @@ class XPUAttentionBackend(AttentionBackend):
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        assert (
-            self.use_mla is False
-        ), "XPUAttentionBackend doesn't support MLA yet, please use --attention-backend triton instead."
         self.skip_prefill = skip_prefill
         self.is_hybrid_swa = model_runner.is_hybrid_swa
         if self.is_hybrid_swa:
