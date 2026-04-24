@@ -368,7 +368,6 @@ class XPUAttentionBackend(AttentionBackend):
             ]
 
         if self.use_mla:
-        if self.use_mla:
             workspace_size = flash_mla_get_workspace_size(
                 self.max_context_len,
                 batch_size,
