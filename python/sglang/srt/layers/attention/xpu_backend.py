@@ -371,7 +371,10 @@ class XPUAttentionBackend(AttentionBackend):
                 sm_count=get_device_core_count(),
                 num_kv_splits=-1,
             )
-            if not hasattr(self, "workspace") or self.workspace.numel() < workspace_size:
+            if (
+                not hasattr(self, "workspace")
+                or self.workspace.numel() < workspace_size
+            ):
                 self.workspace = torch.empty(
                     workspace_size, device=self.device, dtype=torch.uint8
                 )
