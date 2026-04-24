@@ -8,6 +8,7 @@ import unittest
 from functools import wraps
 
 from sglang.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,
@@ -35,7 +36,7 @@ def intel_xpu_benchmark(extra_args=None, min_throughput=None):
         def wrapper(self):
             _cleanup_xpu_memory()
             common_args = [
-                "--disable-radix",
+                "--disable-radix-cache",
                 "--trust-remote-code",
                 "--mem-fraction-static",
                 "0.4",
@@ -77,6 +78,18 @@ class TestIntelXPUBackend(CustomTestCase):
     @intel_xpu_benchmark(["--attention-backend", "intel_xpu", "--page-size", "128"])
     def test_attention_backend(self):
         return DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE
+
+    @intel_xpu_benchmark(
+        [
+            "--json-model-override-args",
+            '{"num_hidden_layers": 4}',
+            "--decode-attention-backend",
+            "intel_xpu",
+        ],
+        min_throughput=32,
+    )
+    def test_mla_decode_attention_backend(self):
+        return DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE
 
 
 if __name__ == "__main__":
