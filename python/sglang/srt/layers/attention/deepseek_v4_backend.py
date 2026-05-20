@@ -47,6 +47,9 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from sglang.srt.layers.attention.dsv4.triton_flashmla import (
+    flash_mla_with_kvcache_triton,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
@@ -54,14 +57,15 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import ceil_align, is_xpu
-
-_is_xpu = is_xpu()
+from sglang.srt.utils import ceil_align, is_cuda, is_xpu
 if TYPE_CHECKING:
     from flash_mla.flash_mla_interface import FlashMLASchedMeta
 
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+_is_cuda = is_cuda()
+_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
@@ -1034,14 +1038,12 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            if _is_xpu:
-                from .flash_mla_with_kvcache_torch import flash_mla_with_kvcache_torch
-
-                fn = flash_mla_with_kvcache_torch
-            else:
+            if _is_cuda:
                 import flash_mla
 
                 fn = flash_mla.flash_mla_with_kvcache
+            else:
+                fn = flash_mla_with_kvcache_triton
 
             o = fn(
                 q=q,
