@@ -1771,6 +1771,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             pass
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        # is_fp4_expert: routed experts are mxfp4-packed (block_k=32 along K)
+        # regardless of the FP8 weight_block_size declared in config.json.
+        block_shape = (
+            [1, 32] if self.is_fp4_expert else self.quant_config.weight_block_size
+        )
         return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
@@ -1787,7 +1792,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ),
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
-            block_shape=self.quant_config.weight_block_size,
+            block_shape=block_shape,
         )
 
     def apply(

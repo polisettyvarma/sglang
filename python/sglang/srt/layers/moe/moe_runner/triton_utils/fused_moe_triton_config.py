@@ -162,6 +162,49 @@ def get_default_config(
             "GROUP_SIZE_M": 8,
         }
         return config
+    if dtype == "mxfp4_w4a16":
+        # MXFP4 uses MX_GROUP_SIZE=32, so BLOCK_SIZE_K must be a multiple of 32
+        # block_shape[1] may be smaller (e.g., [1, 16]), but BLOCK_SIZE_K must
+        # round up to 32 to satisfy the tl.dot_scaled alignment requirement.
+        if _is_xpu:
+            # BMG / Xe2 sweet spot for MXFP4 MoE GEMM:
+            # - BLOCK_SIZE_N>=64 keeps the dot tile wide enough to saturate the
+            #   Xe-core systolic, avoids the 1-PID-per-row underutilization seen
+            #   when N collapses to 16.
+            # - BLOCK_SIZE_K=128 amortizes the scale/dequant work over more dot
+            #   ops per K-iteration (K=4096 then becomes a 32-iter loop).
+            # - num_stages=3 lets the compiler pipeline B-load + dequant + dot
+            #   without overflowing GRF on the small BLOCK_SIZE_M=32 tile.
+            # - Skinny up-projection (small N) drops to BLOCK_SIZE_N=N to keep
+            #   one tile per row of N and avoid wasted compute on the % N wrap.
+            if N >= 256:
+                config = {
+                    "BLOCK_SIZE_M": 32,
+                    "BLOCK_SIZE_N": 128,
+                    "BLOCK_SIZE_K": 128,
+                    "GROUP_SIZE_M": 4,
+                    "num_warps": 8,
+                    "num_stages": 3,
+                }
+            else:
+                config = {
+                    "BLOCK_SIZE_M": 32,
+                    "BLOCK_SIZE_N": 64,
+                    "BLOCK_SIZE_K": 128,
+                    "GROUP_SIZE_M": 4,
+                    "num_warps": 4,
+                    "num_stages": 3,
+                }
+        else:
+            config = {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8,
+                "num_warps": 4,
+                "num_stages": 2,
+            }
+        return config
     if dtype == "fp8_w8a8":
         if block_shape is None:
             config = {
@@ -308,11 +351,14 @@ def get_config_dtype_str(
     use_int4_w4a16: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int8_w8a8: Optional[bool] = False,
+    use_mxfp4_w4a16: Optional[bool] = False,
 ):
     if use_fp8_w8a8:
         return "fp8_w8a8"
     elif use_int8_w8a8:
         return "int8_w8a8"
+    elif use_mxfp4_w4a16:
+        return "mxfp4_w4a16"
     elif use_int4_w4a16:
         return "int4_w4a16"
     elif use_int8_w8a16:
