@@ -89,6 +89,25 @@ def write_zeros_to_output(
 
 
 @triton.jit
+def _e2m1_to_dtype(nibble, dtype: tl.constexpr):
+    # Decode a 4-bit E2M1 value (sign | 2-bit exp | 1-bit mantissa) directly
+    # into `dtype`. The 8 unsigned magnitudes {0, 0.5, 1, 1.5, 2, 3, 4, 6} are
+    # all exactly representable in bf16 and fp16 — no fp32 round-trip needed.
+    sign = (nibble >> 3) & 0x1
+    exp = (nibble >> 1) & 0x3
+    mant = nibble & 0x1
+    mant_d = mant.to(dtype)
+    # exp == 0 (subnormal): mag = mant * 0.5            -> {0.0, 0.5}
+    # exp >= 1  (normal):   mag = (1 + mant*0.5) * 2^(exp-1)
+    # Use ((1 << exp) >> 1) so exp=0 yields 0 (safe — masked out by tl.where).
+    pow2 = ((1 << exp) >> 1).to(dtype)
+    sub_mag = mant_d * tl.full([1], 0.5, dtype)
+    norm_mag = (tl.full([1], 1.0, dtype) + mant_d * tl.full([1], 0.5, dtype)) * pow2
+    mag = tl.where(exp != 0, norm_mag, sub_mag)
+    return tl.where(sign != 0, -mag, mag)
+
+
+@triton.jit
 def fused_moe_kernel_gptq_awq(
     # Pointers to matrices
     a_ptr,
@@ -318,6 +337,237 @@ def fused_moe_kernel_gptq_awq(
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+@triton.jit
+def fused_moe_kernel_mxfp4(
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    b_scale_ptr,
+    bias_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Matrix dimensions
+    N,
+    K,  # logical K (number of FP4 elements along the contracting dim)
+    EM,
+    num_valid_tokens,
+    # Strides for A: (M, K) in `compute_type` (e.g. bf16/fp16).
+    stride_am,
+    stride_ak,
+    # Strides for B: packed FP4 weights of shape (E, N, K // 2), uint8.
+    # `stride_bk` is the stride along the (packed) K axis (i.e. per byte = 2 fp4 vals).
+    stride_be,
+    stride_bk,
+    stride_bn,
+    # Strides for C: (M, topk, N) in `compute_type`.
+    stride_cm,
+    stride_cn,
+    # Strides for B_scale: E8M0 scales of shape (E, N, K // MX_GROUP_SIZE), uint8.
+    stride_bse,
+    stride_bsk,
+    stride_bsn,
+    # Strides for bias: (E, N).
+    stride_bias_e,
+    stride_bias_n,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,  # logical K-tile (must be a multiple of MX_GROUP_SIZE)
+    GROUP_SIZE_M: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    c_sorted: tl.constexpr,
+    filter_expert: tl.constexpr,
+    MX_GROUP_SIZE: tl.constexpr,  # microscaling group size, must be 32 for MXFP4
+    EVEN_K: tl.constexpr,  # True when K % BLOCK_SIZE_K == 0 (skip K-edge masks)
+):
+    """
+    Fused MoE GEMM where weights are MXFP4 (packed E2M1 values, two per byte)
+    with one E8M0 (uint8) scale per group of `MX_GROUP_SIZE` (=32) elements
+    along K. The per-group scales are consumed directly by `tl.dot_scaled`
+    (no dequant of B is performed in software).
+
+    Activations A are passed in `compute_type` (bf16/fp16); the LHS side of
+    `tl.dot_scaled` uses an implicit unit scale (`lhs_scale=None`).
+
+    Layout assumptions:
+      - A:        (M, K)            in compute_type
+      - B:        (E, N, K // 2)    uint8, two FP4 nibbles packed per byte;
+                                    low nibble = even-K element, high = odd-K
+      - B_scale:  (E, N, K // 32)   uint8 (E8M0)
+      - C:        (M, topk, N)      in compute_type
+    """
+    # -----------------------------------------------------------
+    # Pid -> (pid_m, pid_n) with super-grouped ordering for L2 reuse.
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # ----------------------------------------------------------
+    # Token / expert resolution.
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if filter_expert and off_experts == -1:
+        write_zeros_to_output(
+            c_ptr,
+            stride_cm,
+            stride_cn,
+            pid_n,
+            N,
+            offs_token,
+            token_mask,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            compute_type,
+        )
+        return
+
+    # ----------------------------------------------------------
+    # Pointer setup.
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+
+    # A is contiguous in K. We load a [BLOCK_SIZE_M, BLOCK_SIZE_K] tile once per
+    # K-step and then split it into even/odd K halves for the two FP4 dots.
+    a_row_base = offs_token[:, None] // top_k * stride_am
+    offs_k_a = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + a_row_base + offs_k_a[None, :] * stride_ak
+
+    # B is packed: 2 FP4 elements per byte along K. We load a
+    # [PACKED_BLOCK_K, BLOCK_SIZE_N] uint8 tile per K-iteration.
+    PACKED_BLOCK_K: tl.constexpr = BLOCK_SIZE_K // 2
+    offs_bk_packed = tl.arange(0, PACKED_BLOCK_K)
+    b_ptrs = (
+        b_ptr
+        + off_experts * stride_be
+        + (offs_bk_packed[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    )
+
+    # B scales: one E8M0 byte per MX_GROUP_SIZE elements along K. Both nibbles
+    # in one packed byte cover K=[2i, 2i+1]; since MX_GROUP_SIZE=32 is even and
+    # byte-aligned, they share the same scale group:
+    #   scale_idx(byte i) = (2*i) // MX_GROUP_SIZE = i // (MX_GROUP_SIZE // 2)
+    PACKED_PER_SCALE: tl.constexpr = MX_GROUP_SIZE // 2  # bytes per scale
+    SCALES_PER_TILE: tl.constexpr = BLOCK_SIZE_K // MX_GROUP_SIZE
+    scale_idx_in_tile = offs_bk_packed // PACKED_PER_SCALE  # [PACKED_BLOCK_K]
+    bs_ptrs = (
+        b_scale_ptr
+        + off_experts * stride_bse
+        + scale_idx_in_tile[:, None] * stride_bsk
+        + offs_bn[None, :] * stride_bsn
+    )
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    K_PACKED = K // 2
+    num_k_iters = tl.cdiv(K, BLOCK_SIZE_K)
+    for k_iter in range(0, num_k_iters):
+        k_start = k_iter * BLOCK_SIZE_K
+
+        # ---- A: single load per K-tile ----------------------------------
+        if EVEN_K:
+            a_tile = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+        else:
+            k_lane = k_start + offs_k_a
+            a_tile = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & (k_lane[None, :] < K),
+                other=0.0,
+            )
+
+        # ---- B: packed FP4 [PACKED_BLOCK_K, BLOCK_SIZE_N] uint8 ----------
+        if EVEN_K:
+            b_packed = tl.load(b_ptrs)
+        else:
+            packed_k_remaining = K_PACKED - (k_start // 2)
+            b_packed = tl.load(
+                b_ptrs,
+                mask=offs_bk_packed[:, None] < packed_k_remaining,
+                other=0,
+            )
+
+        # ---- B_scale gather ---------------------------------------------
+        if EVEN_K:
+            scale_raw = tl.load(bs_ptrs)
+        else:
+            scale_k_offset = k_start // MX_GROUP_SIZE
+            scales_k_total = tl.cdiv(K, MX_GROUP_SIZE)
+            scale_mask = (scale_idx_in_tile[:, None] + scale_k_offset) < scales_k_total
+            scale_raw = tl.load(bs_ptrs, mask=scale_mask, other=0)
+
+        # Decode E8M0 (uint8 exponent) -> 2^(e-127), then cast to compute_type.
+        if scale_raw.dtype == tl.uint8:
+            scale_dq = tl.math.exp2(scale_raw.to(tl.float32) - 127.0).to(compute_type)
+        else:
+            scale_dq = scale_raw.to(compute_type)
+
+        # Decode E2M1 nibbles directly into compute_type. FP4 magnitudes
+        # {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6} are exact in bf16/fp16.
+        n_low = b_packed & 0xF
+        n_high = (b_packed >> 4) & 0xF
+        b_low_dq = _e2m1_to_dtype(n_low, compute_type) * scale_dq
+        b_high_dq = _e2m1_to_dtype(n_high, compute_type) * scale_dq
+
+        # Split A's K-axis into even / odd halves in-register (no extra loads).
+        # A is contiguous in K, so reshape to (M, PACKED_BLOCK_K, 2) and split
+        # along the trailing 2-axis: index 0 = even-K, index 1 = odd-K.
+        a_even, a_odd = tl.split(a_tile.reshape(BLOCK_SIZE_M, PACKED_BLOCK_K, 2))
+
+        accumulator += tl.dot(a_even, b_low_dq)
+        accumulator += tl.dot(a_odd, b_high_dq)
+
+        # Advance pointers. Both nibbles of one byte share a scale group, so the
+        # scale pointer advances by SCALES_PER_TILE every iteration.
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += PACKED_BLOCK_K * stride_bk
+        bs_ptrs += SCALES_PER_TILE * stride_bsk
+
+    if bias_ptr is not None:
+        bias = tl.load(
+            bias_ptr + off_experts * stride_bias_e + offs_bn[None, :] * stride_bias_n
+        ).to(tl.float32)
+        accumulator = accumulator + bias
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        accumulator = accumulator * moe_weight[:, None]
+
+    accumulator = accumulator.to(compute_type)
+
+    # -----------------------------------------------------------
+    # Store the output tile.
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    if c_sorted:
+        c_ptrs = (
+            c_ptr + stride_cm * offs_token_id[:, None] + stride_cn * offs_cn[None, :]
+        )
+    else:
+        c_ptrs = (
+            c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        )
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+# MXFP4 microscaling group size (fixed by the OCP MX spec).
+_MXFP4_GROUP_SIZE = 32
 
 
 @triton.jit
@@ -734,6 +984,104 @@ def invoke_fused_moe_kernel(
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+
+    # TODO: Add use_mxfp4_w4a16 to thsis functions signature and
+    # use values passed from framework
+    # Temporary hard-coding
+    use_mxfp4_w4a16 = True
+    use_fp8_w8a8 = False
+
+    if use_mxfp4_w4a16:
+        assert B_scale is not None, "MXFP4 requires scales"
+        assert B_scale.dtype in (torch.uint8, torch.float32), (
+            f"MXFP4 expects uint8 (E8M0) or float32 scales, got {B_scale.dtype}"
+        )
+        assert B_zp is None and A_scale is None
+        assert not (a_use_tma or b_use_tma), "TMA is not supported for MXFP4"
+        assert not fuse_sum_all_reduce, "fuse_sum_all_reduce is not supported for MXFP4"
+
+        N = B.shape[1]
+        K = B.shape[2] * 2  # logical K (FP4 elements)
+        assert A.shape[-1] == K, f"A K={A.shape[-1]} mismatches packed B K={K}"
+        assert B_scale.shape == (B.shape[0], N, K // _MXFP4_GROUP_SIZE), (
+            f"unexpected B_scale shape {tuple(B_scale.shape)}; "
+            f"expected ({B.shape[0]}, {N}, {K // _MXFP4_GROUP_SIZE})"
+        )
+        # MXFP4 manual unpacking requires adjustments to meet tl.dot constraints:
+        # - BLOCK_SIZE_K: multiple of MX_GROUP_SIZE (32), >= 64 (so PACKED_BLOCK_K >= 32)
+        # - BLOCK_SIZE_N: >= 16 (tl.dot N dimension minimum)
+        # - BLOCK_SIZE_M: >= 1 (tl.dot M dimension minimum, usually satisfied)
+        min_block_k = max(64, _MXFP4_GROUP_SIZE)
+        min_block_n = 16
+
+        needs_adjustment = (
+            config["BLOCK_SIZE_K"] < min_block_k
+            or config["BLOCK_SIZE_K"] % _MXFP4_GROUP_SIZE != 0
+            or config["BLOCK_SIZE_N"] < min_block_n
+        )
+
+        if needs_adjustment:
+            old_config = dict(config)
+            config = dict(config)  # Make a mutable copy
+
+            # Adjust BLOCK_SIZE_K: round up to multiple of 32, minimum 64
+            if config["BLOCK_SIZE_K"] < min_block_k or config["BLOCK_SIZE_K"] % _MXFP4_GROUP_SIZE != 0:
+                config["BLOCK_SIZE_K"] = max(
+                    min_block_k,
+                    ((config["BLOCK_SIZE_K"] + _MXFP4_GROUP_SIZE - 1) // _MXFP4_GROUP_SIZE) * _MXFP4_GROUP_SIZE
+                )
+
+            # Adjust BLOCK_SIZE_N: minimum 16
+            if config["BLOCK_SIZE_N"] < min_block_n:
+                config["BLOCK_SIZE_N"] = min_block_n
+
+        # tl.dot_scaled with e2m1 format requires uint8 tensors
+        if B.dtype == torch.int8:
+            B = B.view(torch.uint8)
+        if B_scale.dtype == torch.int8:
+            B_scale = B_scale.view(torch.uint8)
+
+        grid = lambda META: (
+            triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+            * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
+
+        fused_moe_kernel_mxfp4[grid](
+            A,
+            B,
+            C,
+            B_scale,
+            bias,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            N,
+            K,
+            sorted_token_ids.shape[0],
+            topk_ids.numel(),
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            C.stride(-2),
+            C.stride(-1),
+            B_scale.stride(0),
+            B_scale.stride(2),
+            B_scale.stride(1),
+            bias.stride(0) if bias is not None else 0,
+            bias.stride(1) if bias is not None else 0,
+            MUL_ROUTED_WEIGHT=mul_routed_weight,
+            top_k=top_k,
+            compute_type=compute_type,
+            c_sorted=c_sorted,
+            filter_expert=filter_expert,
+            MX_GROUP_SIZE=_MXFP4_GROUP_SIZE,
+            EVEN_K=(K % config["BLOCK_SIZE_K"] == 0),
+            **config,
+        )
+        return
 
     if use_fp8_w8a8:
         swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
