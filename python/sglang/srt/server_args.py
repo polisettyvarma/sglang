@@ -4920,15 +4920,11 @@ class ServerArgs:
             self.attention_backend = "triton"
 
         prefill_backend, decode_backend = self.get_attention_backends()
-        if self.use_mla_backend() and prefill_backend == "intel_xpu":
-            raise ValueError(
-                "intel_xpu backend is only supported on decode for MLA models, please set --decode-attention-backend to intel_xpu and do not set --attention-backend or --prefill-attention-backend to intel_xpu for prefill instead use triton."
-            )
 
-        if decode_backend == "intel_xpu":
+        if prefill_backend == "intel_xpu" or decode_backend == "intel_xpu":
             if self.use_mla_backend():
                 supported_page_sizes = [16, 32, 64, 128]
-                msg = "Intel XPU attention backend for MLA Decode"
+                msg = "Intel XPU attention backend for MLA"
             else:
                 supported_page_sizes = [64, 128]
                 msg = "Intel XPU attention backend"
