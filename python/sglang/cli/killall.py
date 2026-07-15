@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kill SGLang processes on CUDA_VISIBLE_DEVICES GPUs (CI mode only).
+"""Kill SGLang processes on CUDA_VISIBLE_DEVICES/ZE_AFFINITY_MASK GPUs (CI mode only).
 
 Called at the start of every CI job to clean up orphaned processes from
 previous (possibly cancelled) runs. Requires SGLANG_IS_IN_CI=true.
@@ -9,12 +9,19 @@ For local/non-CI usage, use scripts/killall_sglang.sh instead.
 Usage:
     python killall.py
 
+Device mode selection (evaluated in order):
+    SGLANG_DEVICE=xpu         → Intel XPU mode
+    ZE_AFFINITY_MASK set      → Intel XPU mode
+    xpu-smi available         → Intel XPU mode
+    otherwise                 → NVIDIA CUDA mode
+
 Exit codes:
     0 - Clean: all target GPUs have <10% memory usage after cleanup
     1 - Dirty: GPU memory still >10% after cleanup, indicating stuck processes
         or orphaned CUDA contexts that need a container restart
 """
 
+import glob
 import os
 import re
 import signal
@@ -178,6 +185,133 @@ def _log_gpu_memory(gpu_indices):
         if pct >= MEMORY_THRESHOLD_PCT:
             dirty.append(f"GPU {idx} ({pct:.0f}%)")
     return dirty
+
+
+# ─────────────────── XPU (Intel GPU) helpers ────────────────────
+
+# renderD128 is the first Intel GPU render node; each subsequent device is +1
+_XPU_RENDER_BASE = 128
+
+
+def _run_xpu_smi(*args):
+    """Run xpu-smi and return output lines; empty list on failure."""
+    try:
+        out = subprocess.check_output(
+            ["xpu-smi"] + list(args),
+            text=True,
+            timeout=10,
+            stderr=subprocess.DEVNULL,
+        )
+        return [line.strip() for line in out.strip().splitlines() if line.strip()]
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return []
+
+
+def _get_xpu_version():
+    """Return first line of xpu-smi discovery output, or None on failure."""
+    lines = _run_xpu_smi("discovery")
+    return lines[0] if lines else None
+
+
+def _get_target_xpus():
+    """Return XPU device indices from ZE_AFFINITY_MASK, or all visible render nodes.
+
+    ZE_AFFINITY_MASK is the Level Zero equivalent of CUDA_VISIBLE_DEVICES.
+    Only numeric indices are supported (e.g. "0,1,2").
+    """
+    zam = os.environ.get("ZE_AFFINITY_MASK")
+    if zam is not None and zam.strip():
+        return {int(d.strip()) for d in zam.split(",") if d.strip().isdigit()}
+    # Auto-detect: /dev/dri/renderD128 → index 0, renderD129 → index 1, …
+    indices = set()
+    for node in glob.glob("/dev/dri/renderD*"):
+        try:
+            indices.add(int(node.removeprefix("/dev/dri/renderD")) - _XPU_RENDER_BASE)
+        except ValueError:
+            pass
+    return indices
+
+
+def _get_xpu_pids(xpu_indices):
+    """Return PIDs with open file handles to the target XPU render nodes."""
+    pids = set()
+    for idx in xpu_indices:
+        device = f"/dev/dri/renderD{_XPU_RENDER_BASE + idx}"
+        if not Path(device).exists():
+            continue
+        try:
+            out = subprocess.check_output(
+                ["lsof", "-t", device],
+                text=True,
+                timeout=10,
+                stderr=subprocess.DEVNULL,
+            )
+            for token in out.split():
+                if token.isdigit():
+                    pids.add(int(token))
+        except (subprocess.SubprocessError, FileNotFoundError):
+            pass
+    return pids
+
+
+def _get_xpu_memory(xpu_indices):
+    """Query memory for target XPU devices via xpu-smi dump.
+
+    Uses metric IDs 18 (memory used, MiB) and 19 (memory free, MiB).
+    Returns list of (idx, used_mib, total_mib, pct) tuples.
+    Returns empty list when xpu-smi is unavailable.
+    """
+    result = []
+    for idx in sorted(xpu_indices):
+        # -n 1: single sample, -i 0: no inter-sample delay
+        lines = _run_xpu_smi(
+            "dump", "-d", str(idx), "-m", "18,19", "-n", "1", "-i", "0"
+        )
+        for line in lines:
+            # Expected CSV: Timestamp,DeviceId,MemUsed,MemFree
+            parts = line.split(",")
+            if len(parts) < 4:
+                continue
+            try:
+                used = float(parts[2].strip())
+                free = float(parts[3].strip())
+                total = used + free
+                pct = used / total * 100 if total > 0 else 0
+                result.append((idx, int(used), int(total), pct))
+                break  # one row per device is enough
+            except (ValueError, IndexError):
+                pass
+    return result
+
+
+def _get_dirty_xpus(xpu_indices):
+    """Return dirty XPU description strings (memory >= threshold, or processes remain)."""
+    memory_data = _get_xpu_memory(xpu_indices)
+    if memory_data:
+        return [
+            f"XPU {idx} ({pct:.0f}%)"
+            for idx, _, _, pct in memory_data
+            if pct >= MEMORY_THRESHOLD_PCT
+        ]
+    # xpu-smi unavailable — fall back to process-count check
+    remaining = _get_xpu_pids(xpu_indices)
+    return [f"XPU ({len(remaining)} processes remaining)"] if remaining else []
+
+
+def _log_xpu_memory(xpu_indices):
+    """Log XPU memory for all target devices. Returns dirty device descriptions."""
+    memory_data = _get_xpu_memory(xpu_indices)
+    if memory_data:
+        dirty = []
+        for idx, used, total, pct in memory_data:
+            _log(f"  XPU {idx}: {used} MiB / {total} MiB ({pct:.0f}%)")
+            if pct >= MEMORY_THRESHOLD_PCT:
+                dirty.append(f"XPU {idx} ({pct:.0f}%)")
+        return dirty
+    # xpu-smi unavailable — report process count instead
+    pids = _get_xpu_pids(xpu_indices)
+    _log(f"  xpu-smi unavailable; {len(pids)} process(es) holding XPU render nodes")
+    return [f"XPU ({len(pids)} processes)"] if pids else []
 
 
 # /proc helpers
@@ -448,8 +582,155 @@ def _ci_mode():
     return 0
 
 
+# ─────────────────── XPU CI mode ────────────────────
+
+
+def _kill_all_xpu_targets(xpu_indices, xpu_pids):
+    """Kill name-matched SGLang processes and all processes holding XPU render nodes."""
+    name_only = _find_sglang_pids_by_name() - xpu_pids
+    if name_only:
+        _kill_pids(name_only, "name-matched SGLang processes")
+        time.sleep(1)
+        _log()
+
+    if xpu_pids:
+        _kill_pids(_get_orchestrator_ancestors(xpu_pids), "orchestrator ancestors")
+        time.sleep(1)
+        for attempt in range(2):
+            current_pids = _get_xpu_pids(xpu_indices)
+            if not current_pids:
+                break
+            label = "XPU processes" if attempt == 0 else "stubborn XPU processes"
+            _kill_pids(current_pids, label)
+            time.sleep(3)
+    _log()
+
+
+def _verify_xpu_clean(xpu_indices):
+    """Retry loop: wait for XPU devices to become clean.
+
+    Returns (dirty_list, unkillable_pids, elapsed_seconds).
+    """
+    max_wait_secs = 100
+    retry_interval = 10
+    elapsed = 0
+    unkillable_pids = {}
+
+    while True:
+        dirty = _get_dirty_xpus(xpu_indices)
+        remaining_pids = _get_xpu_pids(xpu_indices)
+
+        if not dirty:
+            _log(f"Check at {elapsed}s: XPUs clean")
+            break
+
+        dirty_summary = ", ".join(dirty)
+
+        if elapsed >= max_wait_secs:
+            remaining_info = (
+                f", {len(remaining_pids)} processes remaining" if remaining_pids else ""
+            )
+            _log(f"Check at {elapsed}s: still dirty [{dirty_summary}]{remaining_info}")
+            break
+
+        if remaining_pids:
+            failed = _kill_pids(remaining_pids, quiet=True)
+            unkillable_pids.update(failed)
+
+        print(
+            f"[killall] XPUs still dirty at {elapsed}s [{dirty_summary}], "
+            f"retrying in {retry_interval}s "
+            f"({elapsed + retry_interval}/{max_wait_secs}s)..."
+        )
+        time.sleep(retry_interval)
+        elapsed += retry_interval
+
+    if unkillable_pids:
+        parts = [f"{p} ({unkillable_pids[p]})" for p in sorted(unkillable_pids)]
+        _log(f"  Unkillable PIDs: {', '.join(parts)}")
+
+    return dirty, unkillable_pids, elapsed
+
+
+def _xpu_ci_mode():
+    """XPU-scoped kill, abort if devices remain dirty."""
+    xpu_indices = _get_target_xpus()
+    if not xpu_indices:
+        _log("No XPU devices detected, skipping cleanup")
+        _flush_box("killall_sglang", status="SKIP")
+        return 0
+
+    zam = os.environ.get("ZE_AFFINITY_MASK")
+    xpu_list = ", ".join(str(i) for i in sorted(xpu_indices))
+
+    xpu_info = _get_xpu_version()
+    if xpu_info:
+        _log(f"xpu-smi: {xpu_info}")
+    if zam is None or not zam.strip():
+        _log(
+            "WARNING: ZE_AFFINITY_MASK is not set. "
+            "Falling back to all visible XPU devices."
+        )
+        _log("This may kill processes from other CI jobs on shared hosts.")
+    else:
+        _log(f"ZE_AFFINITY_MASK={zam}")
+    _log()
+
+    _log("Before cleanup:")
+    _log_xpu_memory(xpu_indices)
+    xpu_pids = _get_xpu_pids(xpu_indices)
+    if not xpu_pids:
+        _log("  No processes on target XPU devices")
+    else:
+        _log(f"  Processes ({len(xpu_pids)}):")
+        for pid in sorted(xpu_pids):
+            _log(f"    PID {pid}: {_get_pid_cmdline(pid)}")
+    _log()
+
+    _kill_all_xpu_targets(xpu_indices, xpu_pids)
+
+    dirty, unkillable_pids, elapsed = _verify_xpu_clean(xpu_indices)
+
+    if dirty:
+        _log()
+        _log("Final XPU memory:")
+        _log_xpu_memory(xpu_indices)
+        _log(f"ERROR: still dirty: {', '.join(dirty)}")
+        _log(f"Orphaned XPU contexts after {elapsed}s — container needs restart.")
+        _flush_box(f"killall_sglang: XPUs [{xpu_list}]", status="FAIL — Aborting CI")
+        _print_diagnostics(unkillable_pids)
+        return 1
+
+    _flush_box(f"killall_sglang: XPUs [{xpu_list}]", status="PASS — XPUs clean")
+    return 0
+
+
 # Entry point
+
+
+def _is_xpu_environment():
+    """Return True when running in an Intel XPU environment."""
+    if os.environ.get("SGLANG_DEVICE", "").lower() == "xpu":
+        return True
+    if os.environ.get("ZE_AFFINITY_MASK"):
+        return True
+    # xpu-smi present and responsive is a reliable indicator
+    try:
+        subprocess.run(
+            ["xpu-smi", "discovery"],
+            capture_output=True,
+            timeout=5,
+            check=True,
+        )
+        return True
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    return False
+
+
 def main():
+    if _is_xpu_environment():
+        return _xpu_ci_mode()
     return _ci_mode()
 
 
