@@ -1073,6 +1073,40 @@ def get_nvidia_driver_version_str() -> str | None:
         return None
 
 
+@lru_cache(maxsize=1)
+def get_xpu_driver_version() -> tuple:
+    """Return the XPU driver version as a tuple of ints, e.g. (1, 3, 29138).
+    Returns (0,) on failure."""
+    version_str = get_xpu_driver_version_str()
+    if version_str is None:
+        return (0,)
+    try:
+        return tuple(int(x) for x in version_str.split("."))
+    except ValueError:
+        return (0,)
+
+
+@lru_cache(maxsize=1)
+def get_xpu_driver_version_str() -> str | None:
+    """Return the XPU driver version string via xpu-smi.
+    Returns None on failure."""
+    try:
+        result = subprocess.run(
+            ["xpu-smi", "discovery"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        for line in result.stdout.splitlines():
+            if "Driver Version" in line:
+                version_str = line.split(":", 1)[1].strip()
+                return version_str if version_str else None
+        return None
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        return None
+
+
 def check_cuda_result(raw_output):
     import cuda.bindings.runtime as cuda_rt
 

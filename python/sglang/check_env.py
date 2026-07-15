@@ -10,7 +10,7 @@ from collections import OrderedDict, defaultdict
 
 import torch
 
-from sglang.srt.utils import is_hip, is_mps, is_musa, is_npu
+from sglang.srt.utils import is_hip, is_mps, is_musa, is_npu, is_xpu
 
 
 def is_cuda_v2():
@@ -505,6 +505,99 @@ class MUSAEnv(BaseEnv):
             return {}
 
 
+class XPUEnv(BaseEnv):
+    """Environment checker for Intel XPU"""
+
+    EXTRA_PACKAGE_LIST = ["sgl-kernel", "triton-xpu"]
+
+    def __init__(self):
+        super().__init__()
+        self.package_list.extend(XPUEnv.EXTRA_PACKAGE_LIST)
+
+    def get_info(self):
+        xpu_info = {"XPU available": torch.xpu.is_available()}
+
+        if xpu_info["XPU available"]:
+            xpu_info.update(self.get_device_info())
+            xpu_info.update(self._get_xpu_version_info())
+
+        return xpu_info
+
+    def get_device_info(self):
+        """
+        Get information about available XPU devices.
+        """
+        devices = defaultdict(list)
+        for k in range(torch.xpu.device_count()):
+            devices[torch.xpu.get_device_name(k)].append(str(k))
+
+        xpu_info = {}
+        for name, device_ids in devices.items():
+            xpu_info[f"XPU {','.join(device_ids)}"] = name
+
+        return xpu_info
+
+    def _get_xpu_version_info(self):
+        """
+        Get XPU version information.
+        """
+        from torch.utils.cpp_extension import SYCL_HOME
+
+        xpu_info = {"SYCL_HOME": SYCL_HOME}
+
+        if SYCL_HOME and os.path.isdir(SYCL_HOME):
+            xpu_info.update(self._get_icpx_info(SYCL_HOME))
+            xpu_info.update(self._get_xpu_driver_version())
+
+        return xpu_info
+
+    def _get_icpx_info(self, SYCL_HOME: str):
+        """
+        Get icpx (Intel oneAPI DPC++/C++ Compiler) version information.
+        """
+        try:
+            icpx = os.path.join(SYCL_HOME, "bin/icpx")
+            if not os.path.isfile(icpx):
+                # Check path for ONEAPI_ROOT layout (compiler/latest/bin)
+                icpx = os.path.join(SYCL_HOME, "compiler/latest/bin/icpx")
+            icpx_output = (
+                subprocess.check_output(f'"{icpx}" --version', shell=True)
+                .decode("utf-8")
+                .strip()
+            )
+            return {"icpx": icpx_output.split("\n")[0].strip()}
+        except subprocess.SubprocessError:
+            return {"icpx": "Not Available"}
+
+    def _get_xpu_driver_version(self):
+        """
+        Get XPU driver version.
+        """
+        from sglang.srt.utils.common import get_xpu_driver_version_str
+
+        ver = get_xpu_driver_version_str()
+        if ver is None:
+            return {"XPU Driver Version": "Not Available"}
+        return {"XPU Driver Version": ver}
+
+    def get_topology(self):
+        try:
+            result = subprocess.run(
+                ["xpu-smi", "topology", "-m"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+            )
+            return {
+                "XPU Topology": (
+                    "\n" + result.stdout if result.returncode == 0 else None
+                )
+            }
+        except (subprocess.SubprocessError, FileNotFoundError):
+            return {}
+
+
 class MPSEnv(BaseEnv):
     """Environment checker for Apple Silicon MPS"""
 
@@ -590,6 +683,8 @@ if __name__ == "__main__":
         env = NPUEnv()
     elif is_musa():
         env = MUSAEnv()
+    elif is_xpu():
+        env = XPUEnv()
     elif is_mps():
         env = MPSEnv()
     env.check_env()
