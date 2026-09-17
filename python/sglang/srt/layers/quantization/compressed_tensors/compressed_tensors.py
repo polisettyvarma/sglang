@@ -48,6 +48,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
+    CompressedTensorsW8A8MXFp8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
     CompressedTensorsWNA16MoE,
@@ -504,6 +505,36 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Only symmetric weight quantization supported.
         return is_8_bits and is_token and weight_quant.symmetric and is_dynamic
 
+    def _is_mxfp8_w8a8(
+        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
+        """OCP-MX FP8 W8A8: both operands float8, group-32 microscaling.
+
+        Distinguished from regular fp8 W8A8 (tensor/channel/block strategy) by the
+        GROUP strategy with group_size 32 on both weights and activations.
+        """
+        if weight_quant is None or input_quant is None:
+            return False
+        is_floating_point = (
+            weight_quant.type == QuantizationType.FLOAT
+            and input_quant.type == QuantizationType.FLOAT
+        )
+        is_group = (
+            weight_quant.strategy == QuantizationStrategy.GROUP
+            and input_quant.strategy == QuantizationStrategy.GROUP
+        )
+        is_block32 = weight_quant.group_size == 32 and input_quant.group_size == 32
+        is_symmetric = weight_quant.symmetric and input_quant.symmetric
+        # Weights static, activations dynamic (per the mxfp8-quantized recipe).
+        is_weight_static = not weight_quant.dynamic
+        return (
+            is_floating_point
+            and is_group
+            and is_block32
+            and is_symmetric
+            and is_weight_static
+        )
+
     def _is_fp8_w8a8(
         self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
     ) -> bool:
@@ -718,6 +749,16 @@ class CompressedTensorsConfig(QuantizationConfig):
                     raise NotImplementedError(
                         "Current platform does not support w4a4 nvfp4 quantization."
                     )
+
+            # MXFP8 (OCP microscaling, group-32) W8A8 — must be checked before the
+            # generic fp8 W8A8 path, since it is also floating-point W8A8 but uses
+            # the GROUP strategy. On XPU/CRI this dispatches to torch._scaled_mm
+            # (BlockWise1x32) → oneDNN native MXFP8.
+            if is_xpu() and self._is_mxfp8_w8a8(weight_quant, input_quant):
+                return CompressedTensorsW8A8MXFp8(
+                    weight_quant=weight_quant,
+                    input_quant=input_quant,
+                )
 
             if self._is_fp8_w8a8(weight_quant, input_quant):
                 if _is_xpu:
