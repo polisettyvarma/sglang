@@ -135,7 +135,7 @@ python -m sglang.launch_server \
 ## Limitations
 
 - **Supported formats**: Only the `.safetensors` weight format is supported.
-- **Supported devices**: Distributed streaming is supported on CUDA-like devices; otherwise it falls back to non-distributed streaming.
+- **Supported devices**: Weights stream onto CUDA-like, XPU, and CPU devices. Distributed streaming is supported on CUDA-like devices (NCCL) and XPU (XCCL, requires a `runai-model-streamer` release with XPU support); otherwise it falls back to non-distributed streaming.
 
 ## See Also
 

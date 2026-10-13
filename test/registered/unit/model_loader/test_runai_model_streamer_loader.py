@@ -147,6 +147,90 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
         self.assertIs(mock_load_weights.call_args.args[0], fake_model)
         self.assertIs(mock_initialize_model.call_args.args[2], quant_config)
 
+    def test_load_model_targets_accelerator_index(self):
+        """Each supported device must stream to its own indexed device, and an XPU
+        DeviceConfig must not be rejected before the target device is chosen."""
+        for device_type, gpu_id, expected in (
+            ("cuda", 1, "cuda:1"),
+            ("xpu", 1, "xpu:1"),
+            ("cpu", -1, "cpu"),
+        ):
+            with (
+                self.subTest(device_type=device_type),
+                patch.object(loader_mod, "_get_quantization_config"),
+                patch.object(
+                    loader_mod, "_initialize_model", return_value=_FakeModel()
+                ),
+                patch.object(
+                    loader_mod.DefaultModelLoader, "load_weights_and_postprocess"
+                ),
+            ):
+                runai_loader = loader_mod.RunaiModelStreamerLoader(
+                    LoadConfig(load_format=LoadFormat.RUNAI_STREAMER)
+                )
+                runai_loader.load_model(
+                    model_config=cast(
+                        ModelConfig,
+                        SimpleNamespace(dtype=torch.float16, modelopt_quant=False),
+                    ),
+                    device_config=DeviceConfig(device_type, gpu_id),
+                )
+                self.assertEqual(runai_loader.target_device_str, expected)
+
+        runai_loader = loader_mod.RunaiModelStreamerLoader(
+            LoadConfig(load_format=LoadFormat.RUNAI_STREAMER)
+        )
+        with self.assertRaisesRegex(AssertionError, "got hpu"):
+            runai_loader.load_model(
+                model_config=cast(ModelConfig, SimpleNamespace(modelopt_quant=False)),
+                device_config=DeviceConfig("hpu"),
+            )
+
+    def test_iterator_streams_to_device_only_when_distributed(self):
+        """Distributed streaming broadcasts into device memory on CUDA-alike and
+        XPU; every other combination must stream into host memory."""
+        stream_devices = []
+
+        class FakeStreamer:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+            def stream_files(self, _files, device, is_distributed):
+                stream_devices.append(device)
+                self.files_to_tensors_metadata = {}
+
+            def get_tensors(self):
+                return iter(())
+
+        for cuda_alike, xpu, is_distributed, device, expected in (
+            (True, False, True, "cuda:0", "cuda:0"),
+            (False, True, True, "xpu:0", "xpu:0"),
+            (False, True, False, "xpu:0", "cpu"),
+            (False, False, True, "npu:0", "cpu"),
+        ):
+            with (
+                self.subTest(cuda_alike=cuda_alike, xpu=xpu, dist=is_distributed),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "runai_model_streamer": SimpleNamespace(
+                            SafetensorsStreamer=FakeStreamer
+                        )
+                    },
+                ),
+                patch.object(weight_utils, "is_cuda_alike", return_value=cuda_alike),
+                patch.object(weight_utils, "is_xpu", return_value=xpu),
+            ):
+                list(
+                    weight_utils.runai_safetensors_weights_iterator(
+                        ["model.safetensors"], is_distributed, device
+                    )
+                )
+                self.assertEqual(stream_devices.pop(), expected)
+
     def test_marks_streamer_tensors(self):
         source_tensor = torch.tensor([1], dtype=torch.int32)
 
