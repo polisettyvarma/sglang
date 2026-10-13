@@ -69,11 +69,12 @@ from sglang.srt.utils import (
     BAR_FORMAT,
     find_local_repo_dir,
     is_cpu,
+    is_cuda_alike,
     is_hip,
+    is_xpu,
     log_info_on_rank0,
     print_warning_once,
 )
-from sglang.srt.utils.common import is_cuda_alike
 from sglang.utils import is_in_ci
 
 try:
@@ -1684,7 +1685,7 @@ def runai_safetensors_weights_iterator(
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
-    device = device if is_distributed and is_cuda_alike() else "cpu"
+    device = device if is_distributed and (is_cuda_alike() or is_xpu()) else "cpu"
 
     with SafetensorsStreamer() as streamer:
         streamer.stream_files(
