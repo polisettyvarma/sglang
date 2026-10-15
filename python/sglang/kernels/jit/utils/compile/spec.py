@@ -50,6 +50,7 @@ class BuildSpec(msgspec.Struct, frozen=True):
     ldflags: Tuple[str, ...]
     include_paths: Tuple[str, ...]
     header_only: bool
+    device_unit_name: str = "cuda.cu"
 
     @property
     def module_name(self) -> str:
@@ -80,7 +81,7 @@ class BuildSpec(msgspec.Struct, frozen=True):
         units: List[TranslationUnit] = []
         for name, is_cuda, files, wrappers in (
             ("main.cpp", False, self.cpp_files, self.cpp_wrappers),
-            ("cuda.cu", True, self.cuda_files, self.cuda_wrappers),
+            (self.device_unit_name, True, self.cuda_files, self.cuda_wrappers),
         ):
             if not files and not wrappers:
                 continue

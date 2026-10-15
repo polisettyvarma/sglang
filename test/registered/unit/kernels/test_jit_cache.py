@@ -450,7 +450,8 @@ def test_pure_cpp_module_does_not_link_the_gpu_runtime():
         for line in ninja.generate(with_device).splitlines()
         if line.startswith("ldflags = ")
     )
-    assert "cudart" in ldflags or "amdhip" in ldflags
+    # XPU links the SYCL runtime through the -fsycl driver flag.
+    assert "cudart" in ldflags or "amdhip" in ldflags or "-fsycl" in ldflags
 
 
 def test_generated_ninja_is_deterministic():

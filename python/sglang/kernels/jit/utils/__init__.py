@@ -13,6 +13,7 @@ from sglang.kernels.jit.utils.common import (
     get_ci_test_range,
     is_hip_runtime,
     is_musa_runtime,
+    is_xpu_runtime,
     lazy_register_class,
     should_run_full_tests,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "lazy_register_class",
     "is_hip_runtime",
     "is_musa_runtime",
+    "is_xpu_runtime",
     "make_cpp_args",
     "load_jit",
     "cuda_stubs_dir",

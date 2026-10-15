@@ -37,6 +37,8 @@
 #include <sgl_kernel/utils.cuh>
 #elif defined(__HIPCC__)
 #include <sgl_kernel/utils.cuh>
+#elif defined(SYCL_LANGUAGE_VERSION)
+#include <sgl_kernel/xpu/utils.hpp>
 #endif
 
 namespace sglang {
@@ -86,6 +88,15 @@ struct DLDataTypeTrait<fp8_e4m3_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat8_e4m3fn, .bits = 8, .lanes = 1};
 };
 #elif defined(__HIPCC__)
+template <>
+struct DLDataTypeTrait<fp16_t> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
+};
+template <>
+struct DLDataTypeTrait<bf16_t> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
+};
+#elif defined(SYCL_LANGUAGE_VERSION)
 template <>
 struct DLDataTypeTrait<fp16_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};

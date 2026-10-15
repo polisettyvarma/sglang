@@ -22,7 +22,8 @@ from typing import List, Tuple
 import torch
 
 from sglang.kernels.jit.utils.arch import get_jit_cuda_arch
-from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime
+from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime, is_xpu_runtime
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +64,37 @@ def rocm_home() -> str:
 
 
 @cache_once
+def sycl_compiler_path() -> str:
+    """The oneAPI DPC++ compiler (icpx), resolved the way tvm-ffi resolves it."""
+    cmplr_root = os.environ.get("CMPLR_ROOT")
+    icpx = (
+        shutil.which("icpx", path=os.path.join(cmplr_root, "bin"))
+        if cmplr_root
+        else None
+    )
+    icpx = icpx or shutil.which("icpx")
+    oneapi_root = os.environ.get("ONEAPI_ROOT")
+    if icpx is None and oneapi_root:
+        icpx = shutil.which(
+            "icpx", path=os.path.join(oneapi_root, "compiler", "latest", "bin")
+        )
+    if icpx is None:
+        raise RuntimeError(
+            "Cannot find the SYCL compiler icpx for XPU JIT builds. Source the oneAPI "
+            "setvars.sh script or set CMPLR_ROOT."
+        )
+    return icpx
+
+
+@cache_once
 def device_compiler_path() -> str:
-    """The nvcc/hipcc that JIT builds actually invoke.
+    """The nvcc/hipcc/icpx that JIT builds actually invoke.
 
     Resolved the same way tvm-ffi resolves it, so the binary the cache
     fingerprints is the binary that does the compiling.
     """
+    if is_xpu_runtime():
+        return sycl_compiler_path()
     if is_hip_runtime():
         return os.path.join(rocm_home(), "bin", "hipcc")
     return os.path.join(cuda_home(), "bin", "nvcc")
@@ -79,8 +105,11 @@ def host_compiler_path() -> str:
     """The C++ compiler host code is handed to.
 
     nvcc dispatches all host code to it, so its version decides both which
-    system headers are pulled in and how that half is codegen'd.
+    system headers are pulled in and how that half is codegen'd. On XPU it is
+    icpx too: the link step has to run with `-fsycl` to embed the device image.
     """
+    if is_xpu_runtime():
+        return sycl_compiler_path()
     return os.environ.get("CXX", "c++")
 
 
@@ -92,6 +121,15 @@ def gpu_arch_name() -> str:
     CUDA-shaped ``(major, minor)`` capability: the latter maps gfx940/gfx941/
     gfx942 onto a single ``9.4``, which are three different compile targets.
     """
+    if is_xpu_runtime():
+        try:
+            props = torch.xpu.get_device_properties(torch.xpu.current_device())
+            return f"{props.name} (driver {props.driver_version})"
+        except Exception:
+            logger.warning(
+                "Cannot detect the XPU device; the JIT cache target degrades."
+            )
+            return "unknown"
     if not is_hip_runtime():
         return get_jit_cuda_arch().target_name
     try:
@@ -104,7 +142,7 @@ def gpu_arch_name() -> str:
 
 @cache_once
 def toolkit_home() -> pathlib.Path:
-    """The CUDA/ROCm root, derived from the compiler already resolved."""
+    """The CUDA/ROCm/oneAPI compiler root, derived from the compiler already resolved."""
     return pathlib.Path(device_compiler_path()).parent.parent
 
 
@@ -129,11 +167,18 @@ def target_flags() -> List[str]:
     the compiler driver to probe: the value is part of the cache key, so it has
     to be decided here and not rediscovered at build time.
     """
+    if is_xpu_runtime():
+        return ["-fsycl", f"-fsycl-targets={sycl_targets()}"]
     if is_hip_runtime():
         return [f"--offload-arch={gpu_arch_name()}"]
     arch = get_jit_cuda_arch()
     target = f"{arch.major}{arch.minor}{arch.suffix}"
     return [f"-gencode=arch=compute_{target},code=sm_{target}"]
+
+
+def sycl_targets() -> str:
+    """The icpx ``-fsycl-targets`` value; spir64 is finalized for the device at load time."""
+    return envs.SGLANG_JIT_SYCL_TARGETS.get() or "spir64"
 
 
 def base_cxx_flags() -> List[str]:
@@ -143,10 +188,16 @@ def base_cxx_flags() -> List[str]:
     `-std=c++20` from both is what used to make nvcc warn about an incompatible
     redefinition on every single build.
     """
+    if is_xpu_runtime():
+        # Host sources go through icpx too; any device code they hold has to
+        # target what the link step finalizes.
+        return ["-fPIC", *target_flags()]
     return ["-fPIC"]
 
 
 def base_cuda_flags() -> List[str]:
+    if is_xpu_runtime():
+        return ["-fPIC"]
     if is_hip_runtime():
         return ["-fPIC", "-D__HIP_PLATFORM_AMD__=1", "-fno-gpu-rdc"]
     return ["-Xcompiler", "-fPIC"]
@@ -168,6 +219,9 @@ def base_link_flags(*, with_device: bool) -> List[str]:
     """
     _, lib_dir, lib_name = tvm_ffi_paths()
     flags = ["-shared", f"-L{lib_dir}", f"-l{lib_name}"]
+    if is_xpu_runtime():
+        # Every unit is built with -fsycl, and AOT targets are finalized at link.
+        return flags + target_flags()
     if not with_device:
         return flags
     if is_hip_runtime():

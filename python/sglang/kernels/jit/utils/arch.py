@@ -1,4 +1,4 @@
-"""CUDA/ROCm architecture detection and default compile target flags."""
+"""CUDA/ROCm/XPU architecture detection and default compile target flags."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from sglang.kernels.jit.utils.common import (
     cache_once,
     is_hip_runtime,
     is_musa_runtime,
+    is_xpu_runtime,
 )
 from sglang.srt.utils.common import is_cuda
 
@@ -127,6 +128,9 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
         except Exception:
             flags.append("-DHIP_FP8_TYPE_E4M3=1")
         return flags
+    elif is_xpu_runtime():
+        # `-fsycl` and the SYCL targets come from the toolchain, see `toolchain.target_flags`.
+        return ["-DSGL_XPU=1", "-std=c++20", "-O3"]
     else:
         if arch is None:
             arch = get_jit_cuda_arch()
@@ -177,7 +181,7 @@ def get_jit_cuda_arch() -> ArchInfo:
 
 @cache_once
 def is_arch_support_pdl() -> bool:
-    if is_hip_runtime() or is_musa_runtime():
+    if is_hip_runtime() or is_musa_runtime() or is_xpu_runtime():
         return False
     return get_jit_cuda_arch().major >= 9
 

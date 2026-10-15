@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, List, Tuple
 import torch
 
 from sglang.kernels.jit.utils.arch import get_default_target_flags
-from sglang.kernels.jit.utils.common import is_hip_runtime
+from sglang.kernels.jit.utils.common import is_hip_runtime, is_xpu_runtime
 from sglang.kernels.jit.utils.compile import cache, ninja
 from sglang.kernels.jit.utils.compile.paths import (
     DEFAULT_CFLAGS,
@@ -49,8 +49,10 @@ def load_jit(
     *args: str,
     cpp_files: List[str] | None = None,
     cuda_files: List[str] | None = None,
+    sycl_files: List[str] | None = None,
     cpp_wrappers: List[Tuple[str, str]] | None = None,
     cuda_wrappers: List[Tuple[str, str]] | None = None,
+    sycl_wrappers: List[Tuple[str, str]] | None = None,
     extra_cflags: List[str] | None = None,
     extra_cuda_cflags: List[str] | None = None,
     extra_ldflags: List[str] | None = None,
@@ -68,8 +70,11 @@ def load_jit(
                       ``csrc/`` directory; pass an absolute path for a source
                       outside the tree.
     :param cuda_files: CUDA sources, resolved like `cpp_files`.
+    :param sycl_files: SYCL sources for Intel XPU, resolved like `cpp_files`.
+                       They take the place of `cuda_files` on an XPU runtime.
     :param cpp_wrappers: C++ exports to generate.
     :param cuda_wrappers: CUDA exports to generate.
+    :param sycl_wrappers: SYCL exports to generate.
     :param extra_cflags: Extra host compiler flags.
     :param extra_cuda_cflags: Extra device compiler flags.
     :param extra_ldflags: Extra linker flags.
@@ -79,6 +84,13 @@ def load_jit(
                         given entry points. Otherwise the sources must export
                         from the C++ side themselves.
     """
+    if is_xpu_runtime():
+        if cuda_files or cuda_wrappers:
+            raise ValueError("CUDA sources cannot be built for XPU, pass sycl_files.")
+        cuda_files, cuda_wrappers = sycl_files, sycl_wrappers
+    elif sycl_files or sycl_wrappers:
+        raise ValueError("SYCL sources can only be built on an XPU runtime.")
+
     if is_hip_runtime():
         extra_cuda_cflags = [
             flag
@@ -86,7 +98,7 @@ def load_jit(
             if flag not in ("--use_fast_math", "-use_fast_math")
         ]
 
-    if envs.SGLANG_JIT_LOG_RESOURCE_USAGE.get():
+    if envs.SGLANG_JIT_LOG_RESOURCE_USAGE.get() and not is_xpu_runtime():
         # nvcc reports through ptxas; hipcc through a clang remark pass.
         extra_cuda_cflags = list(extra_cuda_cflags or []) + (
             ["-Rpass-analysis=kernel-resource-usage"]
@@ -112,6 +124,7 @@ def load_jit(
         ldflags=tuple(DEFAULT_LDFLAGS + (extra_ldflags or [])),
         include_paths=tuple(includes),
         header_only=header_only,
+        device_unit_name="sycl.cpp" if is_xpu_runtime() else "cuda.cu",
     )
 
     # Generated once and threaded through: the cache key is taken over this

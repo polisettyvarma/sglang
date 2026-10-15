@@ -29,6 +29,7 @@ _NORM_DTYPES = ("float16", "bfloat16")
 _CUDA = frozenset({CapabilityRequirement.CUDA})
 _HIP = frozenset({CapabilityRequirement.HIP})
 _NPU = frozenset({CapabilityRequirement.NPU})
+_XPU = frozenset({CapabilityRequirement.XPU})
 # Unlike the gated-activation ops, sgl_kernel does *not* build the rmsnorm ops
 # for ROCm (production: ``if _is_cuda or _is_xpu or _is_musa: from sgl_kernel
 # import rmsnorm`` — HIP is absent), so AOT here is CUDA-only. ROCm instead has
@@ -56,7 +57,7 @@ class RMSNormOp(BaseFusedOp):
     priority = _NORM_PRIORITY
     capabilities = {
         KernelBackend.AOT: _CUDA,
-        KernelBackend.JIT: _CUDA,
+        KernelBackend.JIT: _CUDA | _XPU,
         KernelBackend.AITER: _HIP,
         KernelBackend.TORCH_NPU: _NPU,
     }
@@ -66,7 +67,7 @@ class RMSNormOp(BaseFusedOp):
     )
     descriptions = {
         KernelBackend.AOT: "RMS normalization (sgl_kernel wheel).",
-        KernelBackend.JIT: "RMS normalization (sglang.kernels.jit).",
+        KernelBackend.JIT: "RMS normalization (sglang.kernels.jit; CUDA and SYCL on XPU).",
         KernelBackend.AITER: "RMS normalization (aiter rmsnorm2d_fwd, ROCm).",
         KernelBackend.TORCH_NPU: "RMS normalization (torch_npu, Ascend).",
         KernelBackend.TORCH: "RMS normalization (pure-torch reference).",

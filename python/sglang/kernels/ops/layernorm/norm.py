@@ -8,6 +8,7 @@ import torch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
+    is_xpu_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -63,6 +64,40 @@ def _jit_rmsnorm_module(hidden_size: int, dtype: torch.dtype) -> Module:
         *args,
         cuda_files=["elementwise/rmsnorm.cuh"],
         cuda_wrappers=[("rmsnorm", f"{kernel_class}::run")],
+    )
+
+
+_RMSNORM_XPU_DTYPES = frozenset({torch.float32, torch.float16, torch.bfloat16})
+_RMSNORM_XPU_MAX_GROUP_SIZE = 256
+
+
+def _rmsnorm_xpu_vec_size(hidden_size: int) -> int:
+    # vectorize only rows wide enough to keep the work-group busy.
+    if hidden_size % 4 != 0 or hidden_size < 512:
+        return 1
+    return 8 if hidden_size % 8 == 0 else 4
+
+
+def _rmsnorm_xpu_group_size(num_vecs: int) -> int:
+    # One work-item per vector up to 256, never below one sub-group (16).
+    return max(16, min(_RMSNORM_XPU_MAX_GROUP_SIZE, 1 << (num_vecs - 1).bit_length()))
+
+
+@cache_once
+def _jit_rmsnorm_xpu_module(hidden_size: int, dtype: torch.dtype) -> Module:
+    if dtype not in _RMSNORM_XPU_DTYPES:
+        raise RuntimeError(
+            f"jit rmsnorm (xpu): unsupported dtype {dtype}. "
+            "Supported: float32, float16, bfloat16."
+        )
+    vec_size = _rmsnorm_xpu_vec_size(hidden_size)
+    group_size = _rmsnorm_xpu_group_size(hidden_size // vec_size)
+    args = make_cpp_args(hidden_size, vec_size, group_size, dtype)
+    return load_jit(
+        "rmsnorm_xpu",
+        *args,
+        sycl_files=["elementwise/rmsnorm_xpu.hpp"],
+        sycl_wrappers=[("rmsnorm", f"RMSNormKernel<{args}>::run")],
     )
 
 
@@ -134,6 +169,10 @@ def rmsnorm(
 ) -> None:
     out = out if out is not None else input
     hidden_size = input.size(-1)
+    if is_xpu_runtime():
+        module = _jit_rmsnorm_xpu_module(hidden_size, input.dtype)
+        module.rmsnorm(input, weight, out, eps)
+        return
     if not _is_supported_rmsnorm_hidden_size(hidden_size):
         raise RuntimeError(
             f"jit rmsnorm: unsupported hidden_size={hidden_size}. "

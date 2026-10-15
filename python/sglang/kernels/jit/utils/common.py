@@ -61,6 +61,12 @@ def is_musa_runtime() -> bool:
     return getattr(torch.version, "musa", None) is not None
 
 
+@cache_once
+def is_xpu_runtime() -> bool:
+    """Intel XPU: kernels are SYCL, built with icpx and launched on a sycl::queue."""
+    return bool(torch.version.xpu)
+
+
 _REGISTERED_CLASSES: Dict[type, type] = {}
 
 

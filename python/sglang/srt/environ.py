@@ -1281,6 +1281,9 @@ class Envs:
     # is a hit on the second run, and a cache hit has nothing to report, so pair
     # this with SGLANG_JIT_FORCE_RECOMPILE to see the report every time.
     SGLANG_JIT_LOG_RESOURCE_USAGE = EnvBool(False)
+    # icpx -fsycl-targets for XPU JIT builds, e.g. "intel_gpu_bmg_g21" to compile
+    # ahead of time. None = unset = spir64, finalized by the driver at load time.
+    SGLANG_JIT_SYCL_TARGETS = EnvStr(None)
     # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
