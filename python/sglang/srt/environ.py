@@ -1577,6 +1577,9 @@ class Envs:
     # sglang.kernels.jit.debug.trace, "naive-debug" also detects overwritten
     # records. Like the flags above, it gets its own cache entry.
     SGLANG_JIT_DEBUG_TRACE = EnvStr(None)
+    # icpx -fsycl-targets for XPU JIT builds, e.g. "intel_gpu_bmg_g21" to compile
+    # ahead of time. None = unset = spir64, finalized by the driver at load time.
+    SGLANG_JIT_SYCL_TARGETS = EnvStr(None)
     # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)

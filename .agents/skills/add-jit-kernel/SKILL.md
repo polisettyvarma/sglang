@@ -13,6 +13,8 @@ does not replace that API contract.
 
 For performance work beyond the mechanics, read the guide for your platform: [performance-cuda.md](performance-cuda.md) (estimating before implementing, SASS checks, SM100 notes, fair comparisons).
 
+For Intel XPU (SYCL kernels built with icpx), follow [add-jit-kernel-xpu](../add-jit-kernel-xpu/SKILL.md) on top of this tutorial: it covers the `sycl_files` build path, the headers that compile under icpx, streams, and XPU tests.
+
 ## When to use JIT vs AOT (`sgl-kernel`)
 
 - **JIT (`jit_kernel`)**: prefer this first for kernels that do **not** depend on CUTLASS or another large C++ project. It is the default choice for lightweight kernels that benefit from rapid iteration and first-use compilation.

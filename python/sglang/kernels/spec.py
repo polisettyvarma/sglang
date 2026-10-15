@@ -40,7 +40,7 @@ class KernelBackend(str, Enum):
     TORCH = "torch"  # pure-torch reference (forward_native)
     TORCH_COMPILE = "torch_compile"  # torch.compile(forward_native)
     TRITON = "triton"
-    JIT = "jit"  # sglang.kernels.jit (nvcc / hipcc)
+    JIT = "jit"  # sglang.kernels.jit (nvcc / hipcc / icpx)
     AOT = "aot"  # sgl_kernel wheel (CUDA / ROCm builds)
     CUTE_DSL = "cute_dsl"
     FLYDSL = "flydsl"  # FlyDSL MLIR compiler (device=HIP, gfx950)
@@ -62,9 +62,10 @@ class DeviceType(str, Enum):
     HIP = "hip"
     MUSA = "musa"
     NPU = "npu"  # Ascend NPU (torch_npu / sgl_kernel_npu)
+    XPU = "xpu"  # Intel GPU (SYCL)
     CPU = "cpu"
     MLU = "mlu"
-    # TODO(RFC #29630): XPU / ... as backends land.
+    # TODO(RFC #29630): more devices as backends land.
 
 
 class PlatformInfo(msgspec.Struct, frozen=True):
@@ -96,6 +97,10 @@ class PlatformInfo(msgspec.Struct, frozen=True):
     @property
     def is_musa(self) -> bool:
         return self.device_type == "musa"
+
+    @property
+    def is_xpu(self) -> bool:
+        return self.device_type == "xpu"
 
     @classmethod
     def detect(cls, *, use_cache: bool = True) -> PlatformInfo:
@@ -137,6 +142,9 @@ class PlatformInfo(msgspec.Struct, frozen=True):
                     cuda_arch_major=major,
                     cuda_arch_minor=minor,
                 )
+            if torch.xpu.is_available():
+                # TODO: torch.xpu.get_device_capability
+                return cls(device_type="xpu")
         except Exception:
             pass
         return cls()
@@ -158,7 +166,7 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
     (``min_cuda_arch`` / ``max_cuda_arch`` apply only when ``device == CUDA``).
 
     The device-only cases are so common that they are exposed as class constants
-    (``CapabilityRequirement.CUDA`` / ``.HIP`` / ``.MUSA`` / ``.NPU``);
+    (``CapabilityRequirement.CUDA`` / ``.HIP`` / ``.MUSA`` / ``.NPU`` / ``.XPU``);
     use :meth:`cuda` for an
     arch-bounded CUDA requirement (e.g. ``CapabilityRequirement.cuda(
     min_sm=(10, 0))`` for SM100+).
@@ -175,6 +183,7 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
     MUSA: ClassVar[CapabilityRequirement]
     NPU: ClassVar[CapabilityRequirement]
     MLU: ClassVar[CapabilityRequirement]
+    XPU: ClassVar[CapabilityRequirement]
 
     @classmethod
     def cuda(
@@ -202,6 +211,7 @@ CapabilityRequirement.HIP = CapabilityRequirement(device=DeviceType.HIP)
 CapabilityRequirement.MUSA = CapabilityRequirement(device=DeviceType.MUSA)
 CapabilityRequirement.NPU = CapabilityRequirement(device=DeviceType.NPU)
 CapabilityRequirement.MLU = CapabilityRequirement(device=DeviceType.MLU)
+CapabilityRequirement.XPU = CapabilityRequirement(device=DeviceType.XPU)
 
 CUDA_ONLY: FrozenSet[CapabilityRequirement] = frozenset({CapabilityRequirement.CUDA})
 

@@ -46,6 +46,7 @@ import importlib.util
 import logging
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sysconfig
@@ -61,6 +62,7 @@ from sglang.kernels.jit.utils.common import (
     is_hip_runtime,
     is_musa_runtime,
     is_sail_runtime,
+    is_xpu_runtime,
 )
 from sglang.kernels.jit.utils.compile import toolchain
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
@@ -225,6 +227,9 @@ def _target_tag() -> str:
         return f"sail_{safe}"
     if is_hip_runtime():
         return toolchain.gpu_arch_name().split(":")[0] or "unknown"
+    if is_xpu_runtime():
+        # A path segment, so the SYCL target rather than the free-form device name.
+        return "xpu_" + re.sub(r"[^A-Za-z0-9_]", "_", toolchain.sycl_targets())
     arch = get_compile_arch()
     prefix = "mp" if is_musa_runtime() else "sm"
     return f"{prefix}{arch.major}{arch.minor}{arch.suffix}"
@@ -250,6 +255,8 @@ def _environment_fingerprint() -> str:
         target = f"hgcc:{arch}:sailify-{sailify_version()}"
     elif is_hip_runtime():
         target = f"hip:{toolchain.gpu_arch_name()}"
+    elif is_xpu_runtime():
+        target = f"xpu:{toolchain.sycl_targets()}:{toolchain.gpu_arch_name()}"
     else:
         arch = get_compile_arch()
         target = f"{'musa' if is_musa_runtime() else 'cuda'}:{arch.target_name}"

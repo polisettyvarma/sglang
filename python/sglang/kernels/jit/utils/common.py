@@ -81,6 +81,12 @@ def is_sail_runtime() -> bool:
     return bool(torch.cuda.is_available() and "ZW" in torch.cuda.get_device_name())
 
 
+@cache_once
+def is_xpu_runtime() -> bool:
+    """Intel XPU: kernels are SYCL, built with icpx and launched on a sycl::queue."""
+    return bool(torch.version.xpu)
+
+
 _REGISTERED_CLASSES: Dict[type, type] = {}
 
 

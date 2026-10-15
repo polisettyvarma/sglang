@@ -1,3 +1,4 @@
+#include <sgl_kernel/impl/rmsnorm_mode.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -16,15 +17,6 @@
 #include <type_traits>
 
 namespace sglang {
-
-// Python passes the enumerator name as the template argument (`using enum` below)
-enum class RMSNormMode {
-  PLAIN,            // out = norm(x) * w
-  FUSED_ADD,        // res = T(x + res); x = norm(res) * w
-  QUANT,            // out8 = fp8(norm(x) * w / scale)
-  FUSED_ADD_QUANT,  // both
-};
-using enum RMSNormMode;
 
 // One row per `kThreadsPerRow` threads (whole warps, or a power-of-two slice of one warp for short
 // rows), `kRowsPerCTA` rows per CTA, `kVecBytes` per access. The thread tile may over-cover the row;

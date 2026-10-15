@@ -13,6 +13,7 @@ from sglang.kernels.jit.utils import (
     is_arch_support_pdl,
     is_hip_runtime,
     is_musa_runtime,
+    is_xpu_runtime,
     load_jit,
     make_cpp_args,
     parallel_compile,
@@ -169,6 +170,46 @@ class RMSNormDispatch:
         return self._decode if num_tokens <= self._threshold else self._prefill
 
 
+_RMSNORM_XPU_DTYPES = frozenset({torch.float32, torch.float16, torch.bfloat16})
+_RMSNORM_XPU_MAX_GROUP_SIZE = 256
+
+
+def _rmsnorm_xpu_vec_size(hidden_size: int) -> int:
+    # vectorize only rows wide enough to keep the work-group busy.
+    if hidden_size % 4 != 0 or hidden_size < 512:
+        return 1
+    return 8 if hidden_size % 8 == 0 else 4
+
+
+def _rmsnorm_xpu_group_size(num_vecs: int) -> int:
+    # One work-item per vector up to 256, never below one sub-group (16).
+    return max(16, min(_RMSNORM_XPU_MAX_GROUP_SIZE, 1 << (num_vecs - 1).bit_length()))
+
+
+@cache_once
+def _jit_rmsnorm_xpu_module(
+    dim: int, dtype: torch.dtype, mode: RMSNormMode, cast_x_before_out_mul: bool
+) -> Module:
+    if mode not in (RMSNormMode.PLAIN, RMSNormMode.FUSED_ADD):
+        raise NotImplementedError(f"jit rmsnorm (xpu): {mode.name} is not supported.")
+    if dtype not in _RMSNORM_XPU_DTYPES:
+        raise RuntimeError(
+            f"jit rmsnorm (xpu): unsupported dtype {dtype}. "
+            "Supported: float32, float16, bfloat16."
+        )
+    vec_size = _rmsnorm_xpu_vec_size(dim)
+    group_size = _rmsnorm_xpu_group_size(dim // vec_size)
+    args = make_cpp_args(
+        dtype, dim, mode.cpp_name, cast_x_before_out_mul, vec_size, group_size
+    )
+    return load_jit(
+        "rmsnorm_xpu",
+        *args,
+        sycl_files=["elementwise/rmsnorm_xpu.hpp"],
+        sycl_wrappers=[("rmsnorm", f"RMSNormKernel<{args}>::run")],
+    )
+
+
 @cache_once
 def precompile_rmsnorm(
     dim: int,
@@ -178,6 +219,10 @@ def precompile_rmsnorm(
 ) -> RMSNormDispatch:
     """Build both schedules of a signature at once, so a token count seen for the first time
     (e.g. inside a CUDA graph capture) never compiles."""
+    if is_xpu_runtime():
+        # One schedule on XPU: both token-count ranges share the module.
+        module = _jit_rmsnorm_xpu_module(dim, dtype, mode, cast_x_before_out_mul)
+        return RMSNormDispatch(module, module, 0)
     decode, prefill, threshold = _schedule_rmsnorm(dim, dtype.itemsize, mode.fused_add)
     modules = parallel_compile(
         functools.partial(

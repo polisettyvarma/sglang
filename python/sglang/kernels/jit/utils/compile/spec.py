@@ -53,6 +53,7 @@ class BuildSpec(msgspec.Struct, frozen=True):
     # Extra header-only device units: the macros each defines before including
     # the CUDA sources. They export nothing.
     cuda_units: Tuple[Tuple[str, ...], ...] = ()
+    device_unit_name: str = "cuda.cu"
 
     @property
     def module_name(self) -> str:
@@ -83,7 +84,7 @@ class BuildSpec(msgspec.Struct, frozen=True):
         units: List[TranslationUnit] = []
         for name, is_cuda, files, wrappers in (
             ("main.cpp", False, self.cpp_files, self.cpp_wrappers),
-            ("cuda.cu", True, self.cuda_files, self.cuda_wrappers),
+            (self.device_unit_name, True, self.cuda_files, self.cuda_wrappers),
         ):
             if not files and not wrappers:
                 continue
@@ -94,9 +95,10 @@ class BuildSpec(msgspec.Struct, frozen=True):
                     source=_wrapper_source(files, wrappers),
                 )
             )
+        device_unit = pathlib.PurePath(self.device_unit_name)
         units += [
             TranslationUnit(
-                filename=f"cuda_unit{index}.cu",
+                filename=f"{device_unit.stem}_unit{index}{device_unit.suffix}",
                 is_cuda=True,
                 source=_unit_source(self.cuda_files, defines),
             )

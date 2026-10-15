@@ -54,6 +54,8 @@ for _fn in ("fused_dual_residual_rmsnorm", "fused_rmsnorm"):
 del _fn
 
 
+_XPU = frozenset({CapabilityRequirement.XPU})
+
 # Public entry points inventoried by logical operator group (RFC #29630).
 # The rmsnorm family: one JIT template for plain / fused residual-add / fp8 per-tensor quant.
 for _fn in ("rmsnorm", "fused_add_rmsnorm", "rmsnorm_quant", "fused_add_rmsnorm_quant"):
@@ -62,7 +64,12 @@ for _fn in ("rmsnorm", "fused_add_rmsnorm", "rmsnorm_quant", "fused_add_rmsnorm_
             op=f"layernorm.{_fn}",
             backend=KernelBackend.JIT,
             target=f"sglang.kernels.ops.layernorm.norm:{_fn}",
-            capabilities=CUDA_ONLY,
+            # Plain and fused residual-add rmsnorm also have a SYCL kernel for Intel XPU.
+            capabilities=(
+                CUDA_ONLY | _XPU
+                if _fn in ("rmsnorm", "fused_add_rmsnorm")
+                else CUDA_ONLY
+            ),
         )
     )
 del _fn
