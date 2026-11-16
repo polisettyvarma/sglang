@@ -280,6 +280,26 @@ from sglang.kernels.ops.elementwise.add_constant import add_constant
 
 For a complete, runnable example, refer to [test_add_constant.py](https://github.com/sgl-project/sglang/blob/main/test/registered/kernels/ops/elementwise/test_add_constant.py).
 
+## Intel XPU (SYCL) Kernels
+
+On an XPU build of PyTorch, JIT kernels are SYCL C++, compiled with the oneAPI DPC++ compiler (`icpx -fsycl`) and loaded through the same `load_jit`. Pass the sources with `sycl_files` / `sycl_wrappers` instead of `cuda_files` / `cuda_wrappers`:
+
+```python Example
+load_jit(
+    "rmsnorm",
+    *args,
+    sycl_files=["elementwise/rmsnorm_xpu.hpp"],
+    sycl_wrappers=[("rmsnorm", f"RMSNormKernel<{args}>::run")],
+)
+```
+
+- Name the source after its CUDA sibling with an `_xpu.hpp` suffix. `.cuh` headers do not compile under `icpx`; use `sgl_kernel/xpu/utils.hpp` (SYCL type aliases, `LaunchKernel` on the current `torch.xpu` stream, sub-group reductions, fp8 e4m3 conversion) together with the host-only `utils.h`, `bits.h` and `tensor.h`.
+- When a CUDA kernel exists, port it one-to-one: the same launcher name, template parameters, call signature and order of floating-point operations, so the Python schedule and module factory serve both devices. The reference is the rmsnorm family: [rmsnorm_xpu.hpp](https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/jit/csrc/elementwise/rmsnorm_xpu.hpp), a port of [rmsnorm.cuh](https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/jit/csrc/elementwise/rmsnorm.cuh).
+- Builds target `spir64` by default, which the driver finalizes for the device on first load. Set `SGLANG_JIT_SYCL_TARGETS` (for example `intel_gpu_bmg_g21`) to compile ahead of time.
+- Register XPU tests with `register_xpu_ci`, and declare `CapabilityRequirement.XPU` on the kernel's registry entry.
+
+The full walkthrough, including tests, benchmarks with XPU graphs and common pitfalls, is the [add-jit-kernel-xpu](https://github.com/sgl-project/sglang/blob/main/.agents/skills/add-jit-kernel-xpu/SKILL.md) skill.
+
 ## C++ Include Library Reference
 
 The JIT kernel framework provides a set of reusable C++ headers in

@@ -9,7 +9,7 @@ import torch
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.layernorm import norm as jit_norm
 from sglang.kernels.ops.layernorm.norm import RMSNormMode, precompile_rmsnorm
-from sglang.srt.utils import get_device, is_hip, is_xpu
+from sglang.srt.utils import get_device, is_hip
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
@@ -21,7 +21,7 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=1500, stage="nightly", runner_config="1-gpu-small")
 register_amd_ci(est_time=600, suite="jit-kernel-unit-test-amd")
-# XPU runs all but the fp8 quant cases; XPU-only cases live in test_rmsnorm_xpu.py.
+# XPU-only cases live in test_rmsnorm_xpu.py.
 register_xpu_ci(est_time=600, suite="stage-b-test-1-gpu-xpu")
 
 EPS = 1e-6
@@ -84,7 +84,7 @@ def _prebuild_modules() -> None:
             for mode in (RMSNormMode.PLAIN, RMSNormMode.FUSED_ADD):
                 signatures.add((hidden_size, dtype, mode, False))
                 signatures.add((hidden_size, dtype, mode, True))
-            if not (is_hip() or is_xpu()) and dtype == torch.bfloat16:
+            if not is_hip() and dtype == torch.bfloat16:
                 signatures.add((hidden_size, dtype, RMSNormMode.QUANT, False))
                 signatures.add((hidden_size, dtype, RMSNormMode.FUSED_ADD_QUANT, False))
     parallel_compile(
@@ -179,7 +179,7 @@ def test_rmsnorm_hf(batch_size: int, hidden_size: int, dtype: torch.dtype) -> No
     _assert_close_16(x, ref_fused, max_ulp=2)
 
 
-@pytest.mark.skipif(is_hip() or is_xpu(), reason="fp8 e4m3 quant modes are CUDA-only")
+@pytest.mark.skipif(is_hip(), reason="fp8 e4m3 quant modes are CUDA-only")
 @pytest.mark.parametrize("batch_size,hidden_size", CASES)
 @pytest.mark.parametrize("fused", [False, True])
 # [1] and 0-D (``input_scale.max()``) are both produced by static FP8 loaders.

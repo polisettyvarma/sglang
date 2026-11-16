@@ -128,9 +128,13 @@ def load_jit(
             else ["-Xptxas=-v"]
         )
     if envs.SGLANG_JIT_ENABLE_LINEINFO.get():
-        extra_cuda_cflags += (
-            ["-gline-tables-only"] if is_hip_runtime() else ["-lineinfo"]
-        )
+        if is_xpu_runtime():
+            # icpx keeps no line tables alone for SPIR-V device code; `-g` carries them.
+            extra_cuda_cflags += ["-g"]
+        else:
+            extra_cuda_cflags += (
+                ["-gline-tables-only"] if is_hip_runtime() else ["-lineinfo"]
+            )
     trace = envs.SGLANG_JIT_DEBUG_TRACE.get()
     if trace:
         if trace not in _TRACE_FLAGS:

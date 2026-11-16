@@ -2,7 +2,8 @@
 /// \brief SYCL counterpart of `utils.cuh` for Intel XPU JIT kernels.
 ///
 /// Provides:
-/// - Element type aliases (`fp16_t`, `bf16_t`, `fp32_t`) bound to SYCL types.
+/// - Element type aliases (`fp16_t`, `bf16_t`, `fp32_t`) bound to SYCL types, and
+///   `fp8_e4m3_t` storage with a float conversion (`device::cast_fp8_e4m3`).
 /// - `device::AlignedVector` for vectorized loads/stores.
 /// - `host::LaunchKernel`, which submits an `nd_range` kernel to the current
 ///   SYCL queue of the tensor's device (the current `torch.xpu` stream).
@@ -18,6 +19,7 @@
 #include <tvm/ffi/error.h>
 #include <tvm/ffi/extra/c_env_api.h>
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 
@@ -26,6 +28,13 @@ namespace sglang {
 using fp32_t = float;
 using fp16_t = ::sycl::half;
 using bf16_t = ::sycl::ext::oneapi::bfloat16;
+
+/// \brief One OCP fp8 e4m3fn value (`torch.float8_e4m3fn`): storage only, built with
+///        `device::cast_fp8_e4m3`. A struct rather than `uint8_t`, so tensor checks see an
+///        fp8 dtype, not an integer one.
+struct fp8_e4m3_t {
+  uint8_t bits;
+};
 
 namespace device {
 
@@ -50,6 +59,53 @@ struct alignas(N * sizeof(T)) AlignedVector {
     return data[i];
   }
 };
+
+/**
+ * \brief Round `value` to fp8 e4m3fn: nearest-even, saturating to +-448, NaN kept as NaN.
+ *
+ * Bit-identical to torch's `value.clamp(-448, 448).to(torch.float8_e4m3fn)`. Done in
+ * software so it needs no fp8 device aspect.
+ */
+inline fp8_e4m3_t cast_fp8_e4m3(float value) {
+  const uint32_t bits = std::bit_cast<uint32_t>(value);
+  const auto sign = static_cast<uint8_t>((bits >> 24) & 0x80u);
+  const uint32_t magnitude = bits & 0x7FFFFFFFu;
+  if (magnitude > 0x7F800000u) return {static_cast<uint8_t>(sign | 0x7Fu)};   // NaN
+  if (magnitude >= 0x43E00000u) return {static_cast<uint8_t>(sign | 0x7Eu)};  // >= 448: max finite
+  if (magnitude < 0x3C800000u) {
+    // Below 2^-6, the smallest normal: count units of 2^-9 (exact power-of-two scaling) and
+    // round to nearest even. A result of 8 is 0x08, the smallest normal, so it carries over.
+    const float units = ::sycl::rint(std::bit_cast<float>(magnitude) * 512.0f);
+    return {static_cast<uint8_t>(sign | static_cast<uint32_t>(units))};
+  }
+  // Normal: rebias the exponent (127 -> 7) and round the mantissa from 23 to 3 bits.
+  const uint32_t exponent = (magnitude >> 23) - 120u;
+  const uint32_t mantissa = magnitude & 0x7FFFFFu;
+  uint32_t code = (exponent << 3) | (mantissa >> 20);
+  const uint32_t rest = mantissa & 0xFFFFFu;
+  if (rest > 0x80000u || (rest == 0x80000u && (code & 1u))) ++code;  // a carry bumps the exponent
+  return {static_cast<uint8_t>(sign | (code < 0x7Eu ? code : 0x7Eu))};
+}
+
+namespace sub_group {
+
+/**
+ * \brief Sum `value` over each group of `kLanes` consecutive lanes of the sub-group, by an
+ *        xor butterfly from `kLanes / 2` down to 1, the order of `warp::reduce_sum` in
+ *        `warp.cuh`. Every lane of a group ends with the group's sum.
+ * \tparam kLanes Lanes per group: a power of two, at most `kSubGroupSize`
+ */
+template <uint32_t kLanes>
+inline float reduce_sum(::sycl::sub_group sg, float value) {
+  static_assert(kLanes > 0 && (kLanes & (kLanes - 1)) == 0 && kLanes <= kSubGroupSize);
+#pragma unroll
+  for (uint32_t mask = kLanes / 2; mask >= 1; mask >>= 1) {
+    value += ::sycl::permute_group_by_xor(sg, value, mask);
+  }
+  return value;
+}
+
+}  // namespace sub_group
 
 }  // namespace device
 

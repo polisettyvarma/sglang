@@ -64,12 +64,8 @@ for _fn in ("rmsnorm", "fused_add_rmsnorm", "rmsnorm_quant", "fused_add_rmsnorm_
             op=f"layernorm.{_fn}",
             backend=KernelBackend.JIT,
             target=f"sglang.kernels.ops.layernorm.norm:{_fn}",
-            # Plain and fused residual-add rmsnorm also have a SYCL kernel for Intel XPU.
-            capabilities=(
-                CUDA_ONLY | _XPU
-                if _fn in ("rmsnorm", "fused_add_rmsnorm")
-                else CUDA_ONLY
-            ),
+            # The whole family also has a SYCL kernel for Intel XPU.
+            capabilities=CUDA_ONLY | _XPU,
         )
     )
 del _fn

@@ -13,13 +13,14 @@ placement and registry metadata, and
 [write-sglang-test](../write-sglang-test/SKILL.md) for test mechanics. This file
 covers only what differs on XPU.
 
-The reference implementation is the XPU RMSNorm:
+The reference implementation is the XPU RMSNorm, a port of the CUDA rmsnorm family
+(plain, fused residual add, fp8 quant, Hugging Face rounding):
 
 | Piece | File |
 |---|---|
-| SYCL kernel + launcher | `python/sglang/kernels/jit/csrc/elementwise/rmsnorm_xpu.hpp` |
+| SYCL kernel + launcher (port of `rmsnorm.cuh`) | `python/sglang/kernels/jit/csrc/elementwise/rmsnorm_xpu.hpp` |
 | SYCL helpers | `python/sglang/kernels/jit/include/sgl_kernel/xpu/utils.hpp` |
-| Python dispatch | `python/sglang/kernels/ops/layernorm/norm.py` (`_jit_rmsnorm_xpu_module`, `precompile_rmsnorm`) |
+| Python dispatch, shared with CUDA | `python/sglang/kernels/ops/layernorm/norm.py` (`_schedule_rmsnorm`, `_jit_rmsnorm_module`) |
 | Mode enum shared with CUDA | `python/sglang/kernels/jit/include/sgl_kernel/impl/rmsnorm_mode.h` |
 | Registry entry | `python/sglang/kernels/ops/layernorm/__init__.py` (`CUDA_ONLY \| _XPU`) |
 | Shared tests (CUDA, ROCm, XPU) | `test/registered/kernels/ops/layernorm/test_rmsnorm.py` |
@@ -51,8 +52,12 @@ The reference implementation is the XPU RMSNorm:
   pass.
 - **Cache:** builds land under `<cache root>/xpu_<targets>/`. The key also
   fingerprints the device name and driver version, so a driver update rebuilds.
-- **Not on XPU:** `SGLANG_JIT_LOG_RESOURCE_USAGE` is ignored, and there is no
-  PDL (`is_arch_support_pdl()` is False).
+- **Line info:** `SGLANG_JIT_ENABLE_LINEINFO` adds `-g` on XPU (icpx keeps no
+  line tables alone for SPIR-V device code), the device debug info VTune and
+  gdb-oneapi map source lines from.
+- **Not on XPU:** `SGLANG_JIT_LOG_RESOURCE_USAGE` is ignored, `SGLANG_JIT_DEBUG_TRACE`
+  has nothing to trace (the hooks live in `debug/trace.cuh`), and there is no PDL
+  (`is_arch_support_pdl()` is False).
 
 ## Headers: what compiles under icpx
 
@@ -62,7 +67,14 @@ The reference implementation is the XPU RMSNorm:
   - `fp32_t` / `fp16_t` / `bf16_t` bound to `float` / `sycl::half` /
     `sycl::ext::oneapi::bfloat16`. `make_cpp_args(torch.float16)` still renders
     `fp16_t`, so the Python side does not change.
-  - `device::kSubGroupSize` (16) and `device::AlignedVector<T, N>`.
+  - `fp8_e4m3_t`, one `torch.float8_e4m3fn` value as storage, and
+    `device::cast_fp8_e4m3(float)`: nearest-even, saturating to +-448, bit-identical
+    to torch's `clamp(-448, 448).to(torch.float8_e4m3fn)`. It is software, so it
+    needs no fp8 device aspect (the `sycl::ext::oneapi::experimental::fp8_e4m3` type
+    does, and converts only from `half` / `bfloat16`).
+  - `device::kSubGroupSize` (16), `device::AlignedVector<T, N>`, and
+    `device::sub_group::reduce_sum<kLanes>(sg, value)`, the xor butterfly of
+    `warp::reduce_sum<kLanes>` in the same order.
   - `host::LaunchKernel(num_groups, group_size, device)(functor)`, which submits
     an `nd_range<1>` to the current queue and rethrows SYCL errors as tvm-ffi
     `RuntimeError`s.
@@ -71,8 +83,9 @@ The reference implementation is the XPU RMSNorm:
 - **Host-only headers that also compile under icpx:** `sgl_kernel/utils.h`
   (`CHECK_HOST`, `div_ceil`), `sgl_kernel/bits.h` (`is_pow2`; it takes unsigned
   types, so cast an `int` template parameter), and `sgl_kernel/tensor.h`.
-  `tensor.h` knows the SYCL fp16/bf16 types, so `TensorMatcher` works unchanged
-  with `.with_device(device)` after `device.set_options<kDLOneAPI>()`.
+  `tensor.h` knows the SYCL fp16/bf16 types and `fp8_e4m3_t`, so `TensorMatcher`
+  works unchanged with `.with_device(device)` after
+  `device.set_options<kDLOneAPI>()`.
 
 ## Streams
 
@@ -90,147 +103,96 @@ streams.
 ## Step 1: The SYCL kernel in `kernels/jit/csrc/`
 
 Name the file after its CUDA sibling with an `_xpu` suffix and a `.hpp`
-extension, e.g. `csrc/elementwise/<name>_xpu.hpp`. Put everything in
-`namespace sglang`. The pattern, from `rmsnorm_xpu.hpp`:
+extension, e.g. `csrc/elementwise/<name>_xpu.hpp`, and put everything in
+`namespace sglang`.
 
-```cpp
-#include <sgl_kernel/bits.h>
-#include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.h>
+**When a CUDA kernel exists, port it one-to-one:** the same tile and schedule
+parameters, the same parameter struct, the same launcher name, template parameters
+and call signature, and the same order of floating-point operations, line for
+line. `rmsnorm_xpu.hpp` mirrors `rmsnorm.cuh` this way. The translation:
 
-#include <sgl_kernel/xpu/utils.hpp>
+| CUDA (`*.cuh`) | SYCL (`*_xpu.hpp`) |
+|---|---|
+| `__global__` kernel function, `__launch_bounds__`, `__grid_constant__` params | a functor with `void operator()(sycl::nd_item<1>) const`, holding the params by value |
+| `threadIdx.x`, `blockIdx.x` | `item.get_local_id(0)`, `item.get_group(0)` |
+| warp (32 lanes), `warp::reduce_sum<kLanes>(v)` | sub-group (16 lanes), `device::sub_group::reduce_sum<kLanes>(item.get_sub_group(), v)` |
+| `__shared__ float s[R][W];` | `auto& s = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[R][W]>(item.get_group());` |
+| `__syncthreads()` | `sycl::group_barrier(item.get_group())` |
+| `fmaf`, `math::rsqrt` | `sycl::fma`, `sycl::rsqrt` |
+| packed pairs (`T2`, `AlignedVector<T2, kPacks>`) | `AlignedVector<T, kVecElems>` of scalars; process the elements in the same order |
+| `cast<fp8x2_e4m3_t>` (saturating) | `device::cast_fp8_e4m3` |
+| `LaunchKernel(grid, block, dev).enable_pdl(kUsePDL)(kernel, params)` | `LaunchKernel(num_groups, group_size, dev)(Kernel{params})`; keep `kUsePDL` in the template and `static_assert(!kUsePDL)` |
+| `device_sym.set_options<kDLGPU>()` | `device_sym.set_options<kDLOneAPI>()` |
+| Blackwell / arch-specific paths (`kMixedFMA`, 32 B vectors) | drop; the generic path is the order to follow |
 
-#include <tvm/ffi/container/tensor.h>
+Where the hardware forces a difference, keep it as small as possible and state it
+in a comment. In rmsnorm the CUDA warp is 32 lanes and the XPU sub-group 16, so a
+32-thread row reduces in two sub-groups plus one local-memory step: the same
+operations in the same order inside each lane, a different reduction tree across
+lanes. 16-lane sub-groups are the native choice on Intel GPUs, and a 32-lane
+sub-group halves the registers each lane has for the row it holds.
 
-#include <sycl/sycl.hpp>
+**Without a CUDA sibling,** follow the same layout anyway: a params struct of
+plain data (the functor is copied to the device: no references, no `TensorView`),
+a device functor with `[[sycl::reqd_sub_group_size(device::kSubGroupSize)]]`, and
+a host struct whose `static void run(...)` validates with `TensorMatcher` and
+launches with `LaunchKernel`.
 
-#include <cstdint>
+Rules that apply either way:
 
-namespace sglang {
-
-// Plain data only: the functor is copied to the device, so no references,
-// no TensorView, no host pointers to host objects.
-struct MyParams {
-  const void* input;
-  void* output;
-  int64_t input_stride;
-  uint32_t num_rows;
-};
-
-/// \brief One work-group per row.
-/// \tparam kVecSize   Elements per vectorized access, chosen in Python
-/// \tparam kGroupSize Work-items per work-group, chosen in Python
-template <int64_t kDim, int kVecSize, uint32_t kGroupSize, typename Float>
-struct MyKernel {
-  MyParams params;
-
-  [[sycl::reqd_sub_group_size(device::kSubGroupSize)]] void operator()(::sycl::nd_item<1> item) const {
-    using Vec = device::AlignedVector<Float, kVecSize>;
-    const int64_t row = item.get_group(0);
-    const int64_t tid = item.get_local_id(0);
-    // Stride by the runtime local range, not kGroupSize (see Pitfalls).
-    const int64_t num_threads = item.get_local_range(0);
-    // ... fp32 accumulation, ::sycl::reduce_over_group(item.get_group(), x, ::sycl::plus<float>()) ...
-  }
-};
-
-/// \brief Validate the tensors and launch `MyKernel`.
-template <int64_t kDim, int kVecSize, uint32_t kGroupSize, typename DType>
-struct MyOp {
-  static_assert(kGroupSize % device::kSubGroupSize == 0);
-
-  static void run(const tvm::ffi::TensorView input, const tvm::ffi::TensorView output) {
-    using namespace host;
-    auto N = SymbolicSize{"num_rows"};
-    auto D = SymbolicSize{"hidden_size"};
-    auto SI = SymbolicSize{"input_stride"};
-    auto device = SymbolicDevice{};
-    D.set_value(kDim);
-    device.set_options<kDLOneAPI>();
-    TensorMatcher({N, D})
-        .with_strides({SI, 1})
-        .with_dtype<DType>()
-        .with_device(device)
-        .ensure_alignment(kVecSize * sizeof(DType))  // the width the kernel vectorizes at
-        .verify(input);
-    // ... verify output, early-return on zero rows ...
-    const auto params = MyParams{/* ... */};
-    LaunchKernel(static_cast<uint32_t>(N.unwrap()), kGroupSize, device.unwrap())(
-        MyKernel<kDim, kVecSize, kGroupSize, DType>{params});
-  }
-};
-
-}  // namespace sglang
-```
-
-Rules that differ from CUDA:
-
-- **Every knob is a template parameter set from Python**, including the
-  work-group size and vector width. The launcher only `static_assert`s that they
-  are consistent (power-of-two vector width, group size a multiple of 16).
+- **Every knob is a template parameter**, chosen in Python, and the C++ side only
+  `static_assert`s that the values are consistent.
 - **Accumulate in fp32** and convert with `static_cast<float>` /
-  `static_cast<Float>`; `sycl::half` and `bfloat16` convert both ways.
-- **Use SYCL group algorithms** (`reduce_over_group`, `group_broadcast`) instead
-  of hand-written shared-memory reductions.
-- **Give the host launcher the CUDA launcher's name, template parameters and call
-  signature**, so the Python side can treat the two modules alike. The XPU
-  `RMSNormKernel<DType, kDim, kMode, kCastXBeforeOutMul, kVecSize, kGroupSize>::run`
-  takes the same `(input, weight, output?, residual?, scale?, eps)` as the CUDA
-  one, with `tvm::ffi::Optional<TensorView>` for the optional tensors, and checks
-  per mode which of them must be present.
+  `static_cast<T>`; `sycl::half` and `bfloat16` convert both ways.
 - **Share mode enums with the CUDA kernel through a host-only header.** A `.cuh`
   cannot be included under icpx, so `RMSNormMode` lives in
-  `sgl_kernel/impl/rmsnorm_mode.h`, included by both kernels. Reject the modes XPU
-  does not implement with a `static_assert` (rmsnorm: the fp8 quant modes).
-- **Inside the device kernel, a mode is a `bool` template parameter**, with the
-  arithmetic of the default mode left untouched: `kFusedAdd` adds the residual
-  first, and `kCastXBeforeOutMul` rounds `x * r` to the activation dtype before
-  the weight multiply, matching the CUDA kernel's flag of the same name.
-- **A fused in-place pass may write a buffer and read it back later in the same
-  work-item without a barrier**, as long as each work-item reads only what it
-  wrote: the fused residual add stores `residual` in the first loop and reloads it
-  in the second, with the work-group reduction in between.
+  `sgl_kernel/impl/rmsnorm_mode.h`, included by both kernels.
+- **Check the dtype in C++** with a `static_assert` whose message names the
+  dtype, as the CUDA template does. The failing build surfaces in Python as a
+  `RuntimeError` carrying that message.
 
 ## Step 2: Python dispatch in `kernels/ops/`
 
-Keep the public functions as they are, and branch where the CUDA side builds its
-module, so every caller (including code that precompiles before graph capture)
-gets the XPU module through the same path. Put the dtype and mode checks and the
-tuning heuristics in a `@cache_once` XPU factory:
+With a one-to-one port, the Python side is the CUDA side's. The public functions,
+the schedule (`_schedule_rmsnorm`), the module factory (`_jit_rmsnorm_module`),
+`precompile_rmsnorm` and `RMSNormDispatch` all serve both platforms. XPU branches
+only where it must:
 
-```python
-@cache_once
-def _jit_my_op_xpu_module(dim: int, dtype: torch.dtype, mode: MyOpMode) -> Module:
-    if mode not in _MY_OP_XPU_MODES:
-        raise NotImplementedError(f"jit my_op (xpu): {mode.name} is not supported.")
-    if dtype not in _MY_OP_XPU_DTYPES:
-        raise RuntimeError(f"jit my_op (xpu): unsupported dtype {dtype}.")
-    vec_size = ...  # heuristic lives here, not in C++
-    group_size = ...
-    args = make_cpp_args(dtype, dim, mode.cpp_name, vec_size, group_size)
-    return load_jit(
-        "my_op_xpu",
-        *args,
-        sycl_files=["elementwise/my_op_xpu.hpp"],
-        sycl_wrappers=[("my_op", f"MyOpKernel<{args}>::run")],
-    )
-```
+- **The source file**, in the module factory:
 
-In rmsnorm that branch is the top of `precompile_rmsnorm`. CUDA builds a decode and
-a prefill schedule there; XPU has one schedule, so the same module serves both
-token-count ranges and the `RMSNormDispatch` object is reused unchanged:
+  ```python
+  wrappers = [("rmsnorm", f"RMSNormKernel<{args}>::run")]
+  if is_xpu_runtime():
+      load_jit_kwargs = dict(sycl_files=["elementwise/rmsnorm_xpu.hpp"], sycl_wrappers=wrappers)
+  else:
+      load_jit_kwargs = dict(cuda_files=["elementwise/rmsnorm.cuh"], cuda_wrappers=wrappers)
+  return load_jit("rmsnorm", *args, **load_jit_kwargs)
+  ```
 
-```python
-if is_xpu_runtime():
-    module = _jit_rmsnorm_xpu_module(dim, dtype, mode, cast_x_before_out_mul)
-    return RMSNormDispatch(module, module, 0)
-```
+  One `load_jit` call keeps the module name and template arguments identical
+  across devices; only the source keyword differs.
 
-If the CUDA side has no such factory, branch once at the top of the public
-function instead, with one `is_xpu_runtime()` check.
+- **A schedule input the hardware decides differently**, inside the schedule
+  function. rmsnorm has two:
+  - the vector width: CUDA always uses 16 B (32 B on Blackwell), while XPU takes the
+    widest power of two that divides the row, up to 16 B, so hidden sizes that are
+    not a multiple of 16 B still run;
+  - rows of those narrower vectors can need more vectors per work-item than CUDA's
+    thread caps allow, so XPU widens such a row to keep each work-item at 8 vectors
+    or fewer, up to 512 work-items. 512 is this kernel's own work-group limit,
+    below the device's 1024, because it holds rows in registers. The XPU tile
+    bounds a work-item by bytes (256, CUDA's 16 vectors of 16 B) rather than by
+    vector count, so the widest odd rows (32 vectors of 2 B) still fit.
 
-A mode or option the XPU kernel does not implement raises `NotImplementedError` on
-XPU, before compiling. Do not silently ignore it: it changes the numbers.
+Everything else in the schedule (threads per row, rows per work-group, the
+decode/prefill threshold, per-size overrides) applies unchanged: every fp16 / bf16
+schedule with 16 B vectors equals CUDA's. Only fp32, which the CUDA kernel does not
+take, can be widened at the same hidden size (from 8196 up, and 3072).
+
+Without a CUDA factory to share, add a `@cache_once` XPU module factory and branch
+once at the top of the public function, with one `is_xpu_runtime()` check. A mode
+or option the XPU kernel does not implement then raises `NotImplementedError`
+there, before compiling. Do not silently ignore it: it changes the numbers.
 
 ## Step 3: Registry capabilities
 
@@ -289,10 +251,10 @@ pytestmark = pytest.mark.skipif(not is_xpu(), reason="XPU required")
 
 Put here what only the XPU kernel has:
 
-- **Its own dtypes and shapes.** Cover each vectorization path, rows not a
-  multiple of the group size, and the case where the number of vectors per row is
-  one more than a multiple of the group size (e.g. hidden size 1028 with 4-wide
-  vectors and 256 work-items).
+- **Its own dtypes and shapes.** Cover what the shared file's shapes cannot reach
+  on XPU: XPU-only dtypes, rows that run narrower vectors than CUDA's, short rows
+  packed several to a work-group, and threads whose last vector falls past the
+  row.
 - **Its negative branches**: misaligned row strides (expect `aligned`) and
   unsupported dtypes.
 - **Rounding modes, separated with exact matches.** Two modes that differ by one
@@ -380,6 +342,7 @@ pip index is unreachable; this install needs nothing from it.
 | `CUDA sources cannot be built for XPU, pass sycl_files.` | Pass `sycl_files` / `sycl_wrappers` on XPU. |
 | `No SYCL queue is set for oneapi:<n>` | The call did not carry XPU tensors from torch, or torch is too old to report its XPU stream (see Streams). |
 | `Tensor stride for dimension 0 is not aligned to N bytes` (or `Tensor data pointer is not aligned ...`) | The rows do not fit the kernel's vector width; this is the `ensure_alignment` contract working. |
+| `SYCL error (4): Total number of work-items in a work-group cannot exceed N for this kernel` | The compiled kernel's work-group limit is below the device's `max_work_group_size`, typically because it holds data in registers. Cap the schedule at that limit. |
 | `no matching function for call to 'is_pow2'` | `bits.h` takes unsigned types; cast the template parameter. |
-| Wrong values only when vectors per row is one more than a multiple of the group size | icpx 2026.3 (spir64) miscompiles a work-item loop strided by a compile-time constant. Stride by `item.get_local_range(0)` instead. Revisit on a compiler upgrade. |
+| Wrong values only when the item count is one more than a multiple of the work-group size, in a loop `for (i = tid; i < n; i += kConstStride)` | icpx 2026.3 (spir64) miscompiles that loop shape. Stride by `item.get_local_range(0)`, or use the CUDA kernels' fixed-trip loop with an `in_bound` guard, which is not affected. Revisit on a compiler upgrade. |
 | Every first call is slow | `spir64` is finalized by the driver on first load; set `SGLANG_JIT_SYCL_TARGETS` to an `intel_gpu_*` target to compile ahead of time. |

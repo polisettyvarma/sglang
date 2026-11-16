@@ -105,6 +105,10 @@ template <>
 struct DLDataTypeTrait<bf16_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
 };
+template <>
+struct DLDataTypeTrait<fp8_e4m3_t> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat8_e4m3fn, .bits = 8, .lanes = 1};
+};
 #endif
 
 template <DLDeviceType Code>
